@@ -1,0 +1,97 @@
+syntax = "proto3";
+package accounts;
+option go_package = ".;accounts";
+
+import "google/protobuf/timestamp.proto";
+
+
+// Account represents a transactional account linked to a wallet
+message Account {
+  string id = 1;
+  string walletId = 2;
+  string ownerId = 3;
+  optional string tenantId = 5;
+  string name = 6;
+  string assetType = 7;
+  string type = 8; // STATIC | VIRTUAL_DISPOSABLE | VIRTUAL_FIXED
+  string state = 9; // CREATED | PROCESSING | COMPLETED | CANCELLED
+  string status = 10; // ACTIVE | INACTIVE | EXPIRED | CLOSED
+  string currency = 11;
+  string balance = 12;
+  google.protobuf.Timestamp expiryTime = 13;
+  google.protobuf.Timestamp timeCreated = 14;
+  google.protobuf.Timestamp timeUpdated = 15;
+  string chargeBearer = 16;
+  map<string, string> metadata = 17;
+}
+
+
+
+// AccountDetails holds the provider-specific transaction details
+message AccountAddress {
+  string id = 1;
+  string ownerId = 2;
+  optional string tenantId = 3;
+  string walletId = 4;
+  string accountId = 5;
+  string assetType = 6;
+  // type field is used to determine the structure of the data field.
+  // if `assetType` is `FIAT`, then the type field can contain any of the following values:
+  // NUBAN, SEPA, ACH, etc etc.
+  // if `assetType` is `CRYPTO`, then the type field can contain any of the following values:
+  // BTC, ETH, LTC, etc etc.
+  string type = 7;
+  // data field is a JSON structure according to the account address type field.
+  string data = 8;
+  map<string, string> metadata = 9;
+  google.protobuf.Timestamp timeCreated = 10;
+  google.protobuf.Timestamp timeUpdated = 11;
+  string externalProviderName = 12;
+  string externalProviderId = 13;
+  string externalProviderReference = 14;
+  string state = 15; // CREATED | PROCESSING | COMPLETED | CANCELLED
+  string status = 16; // ACTIVE | INACTIVE | CLOSED
+}
+
+message CreateStaticAccountRequest {
+  string walletId = 1;
+  string assetType = 4;
+  string currency = 5;
+  string chargeBearer = 7;
+  map<string, string> metadata = 8;
+}
+
+message CreateVirtualAccountRequest {
+  string walletId = 1;
+  string assetType = 4;
+  string currency = 5;
+  string type = 6; // VIRTUAL_DISPOSABLE | VIRTUAL_FIXED
+  string chargeBearer = 7;
+  map<string, string> metadata = 8;
+}
+
+message ListAccountsRequest {
+  optional string status = 1;
+  optional string assetType = 2;
+  optional string type = 3;
+  optional string walletId = 4;
+  optional string currency = 5;
+  optional string tenantId = 6;
+  optional string pageCursor = 7;
+  int64 limit = 8;
+}
+
+message ListAccountsResponse {
+  repeated Account data = 1;
+  string nextPageCursor = 2;
+  string prevPageCursor = 3;
+}
+
+message CreditAccountRequest {
+  string accountId = 1;
+  double amount = 2;
+  string currency = 3;
+  string reference = 4;
+  string description = 5;
+  map<string, string> metadata = 6;
+}

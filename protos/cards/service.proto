@@ -1,0 +1,29 @@
+syntax = "proto3";
+package accounts;
+option go_package = ".;accounts";
+
+import "definitions.proto";
+import "accounts.proto";
+import "wallet.proto";
+
+
+service AccountService {
+  rpc CreateWallet(CreateWalletRequest) returns (Wallet);
+  rpc GetWallet(GetByIdRequest) returns (Wallet);
+  rpc ListWallets(ListWalletsRequest) returns (ListWalletsResponse);
+  rpc SetWalletPin(SetWalletPinRequest) returns (RemarksResponse);
+  rpc ConfirmSetWalletPin(ConfirmSetWalletPinRequest) returns (RemarksResponse);
+//  rpc CreditWallet(CreditWalletRequest) returns (CreditWalletResponse);
+
+
+  rpc CreateStaticAccount(CreateStaticAccountRequest) returns (Account);
+  rpc CreateVirtualAccount(CreateVirtualAccountRequest) returns (Account);
+  rpc GetAccount(GetByIdRequest) returns (Account);
+  rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
+//  rpc CreditAccount(CreditAccountRequest) returns (CreditAccountResponse);
+//  rpc DebitAccount(DebitAccountRequest) returns (DebitAccountResponse);
+}
+
+
+
+message Void {}

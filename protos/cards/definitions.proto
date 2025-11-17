@@ -1,0 +1,33 @@
+syntax = "proto3";
+package accounts;
+option go_package = ".;accounts";
+
+import "google/protobuf/timestamp.proto";
+
+
+
+
+message GetByIdRequest {
+  string id = 1;
+}
+
+message CreditWalletRequest {
+  string id = 1;
+  double amount = 2;
+  string currency = 3;
+  string reason = 4;
+  optional string reference = 5;
+  optional string idempotencyKey = 6;
+}
+
+message CreditWalletResponse {
+  string id = 1;
+  double amount = 2;
+  string currency = 3;
+  string reference = 4;
+  google.protobuf.Timestamp time = 5;
+}
+
+message RemarksResponse {
+  string remarks = 1;
+}

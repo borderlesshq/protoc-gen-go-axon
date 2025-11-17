@@ -1,0 +1,68 @@
+syntax = "proto3";
+package accounts;
+option go_package = ".;accounts";
+
+import "google/protobuf/timestamp.proto";
+
+// Main Wallet message
+message Wallet {
+  string id = 1;
+  optional string tenantId = 2;
+  string name = 3;
+  string currency = 4;
+  string balance = 5;
+  string ownerId = 6;
+  string ownerName = 7;
+  string ownerEmail = 8;
+  string ownerType = 9; // INDIVIDUAL | CORPORATE | TENANT | PLATFORM
+  string status = 10; // ACTIVE | INACTIVE | CLOSED
+  string state = 11; // CREATED | PROCESSING | COMPLETED | CANCELLED
+  google.protobuf.Timestamp timeCreated = 12;
+  google.protobuf.Timestamp timeUpdated = 13;
+  optional bool isTenantRootWallet = 14;
+  optional string pin = 15;
+}
+
+message CreateWalletRequest {
+  string ownerId = 1;
+  optional string tenantId = 2;
+  string name = 3;
+  string currency = 4;
+  string ownerEmail = 5;
+  string ownerName = 6;
+  string ownerType = 7; // INDIVIDUAL | CORPORATE | TENANT | PLATFORM
+  optional bool isTenantRootWallet = 8;
+  map<string, string> metadata = 9;
+}
+
+
+message ListWalletsRequest {
+  optional string status = 1;
+  optional string ownerType = 3;
+  optional string ownerId = 4;
+  optional string currency = 5;
+  optional string tenantId = 6;
+  optional string pageCursor = 7;
+  optional string isRootWallet = 8;
+  int64 limit = 9;
+}
+
+message ListWalletsResponse {
+  repeated Wallet data = 1;
+  string nextPageCursor = 2;
+  string prevPageCursor = 3;
+}
+
+message SetWalletPinRequest {
+  string ownerId = 1;
+  string walletId = 2;
+  string pin = 3;
+  string repeatPin = 4;
+}
+
+
+message ConfirmSetWalletPinRequest {
+  string walletId = 1;
+  string ownerId = 2;
+  string otp = 3;
+}
