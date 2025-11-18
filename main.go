@@ -34,7 +34,7 @@ func generateFile(gen *protogen.Plugin, file *protogen.File) {
 		return
 	}
 
-	filename := file.GeneratedFilenamePrefix + "_borderless.pb.go"
+	filename := file.GeneratedFilenamePrefix + "_axon.pb.go"
 	g := gen.NewGeneratedFile(filename, file.GoImportPath)
 
 	// Parse template data
@@ -159,7 +159,94 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"google.golang.org/protobuf/proto"
+	
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// Tracing configuration
+var (
+	globalTracer     trace.Tracer
+	globalPropagator propagation.TextMapPropagator
+	tracingEnabled   bool
+)
+
+// EnableTracing enables distributed tracing for this package.
+// Must be called before creating clients or registering servers.
+// 
+// Example:
+//   tp := sdktrace.NewTracerProvider(...)
+//   otel.SetTracerProvider(tp)
+//   EnableTracing()
+func EnableTracing() {
+	tracingEnabled = true
+	globalTracer = otel.Tracer("{{.PackageName}}")
+	globalPropagator = otel.GetTextMapPropagator()
+}
+
+// DisableTracing disables distributed tracing for this package.
+func DisableTracing() {
+	tracingEnabled = false
+	globalTracer = nil
+	globalPropagator = nil
+}
+
+// IsTracingEnabled returns whether tracing is currently enabled.
+func IsTracingEnabled() bool {
+	return tracingEnabled
+}
+
+// natsHeaderCarrier adapts NATS headers to OpenTelemetry propagation.
+type natsHeaderCarrier struct {
+	header nats.Header
+}
+
+func (c natsHeaderCarrier) Get(key string) string {
+	return c.header.Get(key)
+}
+
+func (c natsHeaderCarrier) Set(key string, value string) {
+	c.header.Set(key, value)
+}
+
+func (c natsHeaderCarrier) Keys() []string {
+	keys := make([]string, 0, len(c.header))
+	for k := range c.header {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// startSpan starts a span if tracing is enabled, otherwise returns the context unchanged.
+func startSpan(ctx context.Context, operationName string, kind trace.SpanKind, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	if !tracingEnabled || globalTracer == nil {
+		return ctx, trace.SpanFromContext(ctx) // Returns no-op span
+	}
+	
+	return globalTracer.Start(ctx, operationName,
+		trace.WithSpanKind(kind),
+		trace.WithAttributes(attrs...),
+	)
+}
+
+// injectTraceContext injects trace context into NATS headers if tracing is enabled.
+func injectTraceContext(ctx context.Context, header nats.Header) {
+	if !tracingEnabled || globalPropagator == nil {
+		return
+	}
+	globalPropagator.Inject(ctx, natsHeaderCarrier{header: header})
+}
+
+// extractTraceContext extracts trace context from NATS headers if tracing is enabled.
+func extractTraceContext(ctx context.Context, header nats.Header) context.Context {
+	if !tracingEnabled || globalPropagator == nil {
+		return ctx
+	}
+	return globalPropagator.Extract(ctx, natsHeaderCarrier{header: header})
+}
 
 // CallOption configures a Call before it starts or extracts information from
 // a Call after it completes.
@@ -291,6 +378,15 @@ var _ = template.Must(fileTemplate.New("clientMethodSignature").Parse(`
 var _ = template.Must(fileTemplate.New("clientMethod").Parse(`
 {{if isUnary .}}
 func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.InputType}}, opts ...CallOption) ({{.OutputType}}, error) {
+	// Start tracing span if enabled
+	ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
+		trace.SpanKindClient,
+		attribute.String("rpc.system", "nats"),
+		attribute.String("rpc.service", "{{.ServiceName}}"),
+		attribute.String("rpc.method", "{{.Name}}"),
+	)
+	defer span.End()
+
 	callOpts := defaultCallOptions()
 	for _, opt := range opts {
 		opt(callOpts)
@@ -298,28 +394,73 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 
 	data, err := proto.Marshal(in)
 	if err != nil {
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to marshal request")
+		}
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	msg, err := c.nc.RequestWithContext(ctx, "{{.Topic}}", data)
+	// Create message with headers
+	msg := &nats.Msg{
+		Subject: "{{.Topic}}",
+		Data:    data,
+		Header:  make(nats.Header),
+	}
+
+	// Inject trace context into headers
+	injectTraceContext(ctx, msg.Header)
+
+	// Add custom headers
+	for k, v := range callOpts.headers {
+		msg.Header.Set(k, v)
+	}
+
+	resp, err := c.nc.RequestMsgWithContext(ctx, msg)
 	if err != nil {
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 
 	// Check for error in response headers
-	if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
-		return nil, fmt.Errorf("server error: %s", errMsg)
+	if errMsg := resp.Header.Get("X-Error"); errMsg != "" {
+		err := fmt.Errorf("server error: %s", errMsg)
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, errMsg)
+		}
+		return nil, err
 	}
 
 	out := &{{.OutputTypeName}}{}
-	if err := proto.Unmarshal(msg.Data, out); err != nil {
+	if err := proto.Unmarshal(resp.Data, out); err != nil {
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to unmarshal response")
+		}
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
+	if tracingEnabled {
+		span.SetStatus(codes.Ok, "")
+	}
 	return out, nil
 }
 {{else if isServerStreaming .}}
 func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.InputType}}, opts ...CallOption) ({{streamType .ServiceName .Name "Client"}}, error) {
+	// Start tracing span if enabled
+	ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
+		trace.SpanKindClient,
+		attribute.String("rpc.system", "nats"),
+		attribute.String("rpc.service", "{{.ServiceName}}"),
+		attribute.String("rpc.method", "{{.Name}}"),
+		attribute.String("stream.type", "server"),
+	)
+	// Span is closed by stream.CloseSend()
+
 	callOpts := defaultCallOptions()
 	for _, opt := range opts {
 		opt(callOpts)
@@ -327,6 +468,11 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 
 	data, err := proto.Marshal(in)
 	if err != nil {
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to marshal request")
+			span.End()
+		}
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
@@ -335,18 +481,30 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 	recvCh := make(chan {{.OutputType}}, 10)
 	errCh := make(chan error, 1)
 
+	messageCount := 0
 	// Subscribe to stream responses
 	sub, err := c.nc.Subscribe(inbox, func(msg *nats.Msg) {
 		// Check for EOF signal
 		if msg.Header.Get("Stream-EOF") == "true" {
+			if tracingEnabled {
+				span.SetAttributes(attribute.Int("stream.messages_received", messageCount))
+				span.SetStatus(codes.Ok, "")
+				span.End()
+			}
 			close(recvCh)
 			return
 		}
 
 		// Check for error
 		if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
+			err := fmt.Errorf("stream error: %s", errMsg)
+			if tracingEnabled {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, errMsg)
+				span.End()
+			}
 			select {
-			case errCh <- fmt.Errorf("stream error: %s", errMsg):
+			case errCh <- err:
 			default:
 			}
 			close(recvCh)
@@ -355,6 +513,9 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 
 		out := &{{.OutputTypeName}}{}
 		if err := proto.Unmarshal(msg.Data, out); err != nil {
+			if tracingEnabled {
+				span.RecordError(err)
+			}
 			select {
 			case errCh <- fmt.Errorf("unmarshal error: %w", err):
 			default:
@@ -362,19 +523,50 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 			return
 		}
 
+		messageCount++
 		select {
 		case recvCh <- out:
 		case <-ctx.Done():
+			if tracingEnabled {
+				span.SetStatus(codes.Error, "context cancelled")
+				span.End()
+			}
 			return
 		}
 	})
 	if err != nil {
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to subscribe")
+			span.End()
+		}
 		return nil, fmt.Errorf("failed to subscribe: %w", err)
 	}
 
+	// Create request message
+	msg := &nats.Msg{
+		Subject: "{{.Topic}}",
+		Reply:   inbox,
+		Data:    data,
+		Header:  make(nats.Header),
+	}
+
+	// Inject trace context
+	injectTraceContext(ctx, msg.Header)
+
+	// Add custom headers
+	for k, v := range callOpts.headers {
+		msg.Header.Set(k, v)
+	}
+
 	// Send initial request with reply-to inbox
-	if err := c.nc.PublishRequest("{{.Topic}}", inbox, data); err != nil {
+	if err := c.nc.PublishMsg(msg); err != nil {
 		sub.Unsubscribe()
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to publish request")
+			span.End()
+		}
 		return nil, fmt.Errorf("failed to publish request: %w", err)
 	}
 
@@ -384,12 +576,17 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 		recvCh: recvCh,
 		errCh:  errCh,
 		ctx:    ctx,
+		span:   span,
 	}
 
 	// Handle cleanup on context cancellation
 	go func() {
 		<-ctx.Done()
 		sub.Unsubscribe()
+		if tracingEnabled && span.IsRecording() {
+			span.SetStatus(codes.Error, "context cancelled")
+			span.End()
+		}
 		close(recvCh)
 	}()
 
@@ -397,6 +594,16 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 }
 {{else if isClientStreaming .}}
 func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...CallOption) ({{streamType .ServiceName .Name "Client"}}, error) {
+	// Start tracing span if enabled
+	ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
+		trace.SpanKindClient,
+		attribute.String("rpc.system", "nats"),
+		attribute.String("rpc.service", "{{.ServiceName}}"),
+		attribute.String("rpc.method", "{{.Name}}"),
+		attribute.String("stream.type", "client"),
+	)
+	// Span is closed by stream.CloseAndRecv()
+
 	callOpts := defaultCallOptions()
 	for _, opt := range opts {
 		opt(callOpts)
@@ -408,6 +615,11 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 	// Subscribe for final response
 	responseSub, err := c.nc.SubscribeSync(responseInbox)
 	if err != nil {
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to subscribe to response")
+			span.End()
+		}
 		return nil, fmt.Errorf("failed to subscribe to response: %w", err)
 	}
 
@@ -417,11 +629,22 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 		topic:       "{{.Topic}}",
 		responseSub: responseSub,
 		ctx:         ctx,
+		span:        span,
 		seqNum:      0,
 	}, nil
 }
 {{else}}
 func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...CallOption) ({{streamType .ServiceName .Name "Client"}}, error) {
+	// Start tracing span if enabled
+	ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
+		trace.SpanKindClient,
+		attribute.String("rpc.system", "nats"),
+		attribute.String("rpc.service", "{{.ServiceName}}"),
+		attribute.String("rpc.method", "{{.Name}}"),
+		attribute.String("stream.type", "bidirectional"),
+	)
+	// Span is closed by stream.CloseSend()
+
 	callOpts := defaultCallOptions()
 	for _, opt := range opts {
 		opt(callOpts)
@@ -435,14 +658,24 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 	sub, err := c.nc.Subscribe(streamID+".out", func(msg *nats.Msg) {
 		// Check for EOF
 		if msg.Header.Get("Stream-EOF") == "true" {
+			if tracingEnabled {
+				span.SetStatus(codes.Ok, "")
+				span.End()
+			}
 			close(recvCh)
 			return
 		}
 
 		// Check for error
 		if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
+			err := fmt.Errorf("stream error: %s", errMsg)
+			if tracingEnabled {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, errMsg)
+				span.End()
+			}
 			select {
-			case errCh <- fmt.Errorf("stream error: %s", errMsg):
+			case errCh <- err:
 			default:
 			}
 			close(recvCh)
@@ -451,6 +684,9 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 
 		out := &{{.OutputTypeName}}{}
 		if err := proto.Unmarshal(msg.Data, out); err != nil {
+			if tracingEnabled {
+				span.RecordError(err)
+			}
 			select {
 			case errCh <- fmt.Errorf("unmarshal error: %w", err):
 			default:
@@ -461,21 +697,39 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 		select {
 		case recvCh <- out:
 		case <-ctx.Done():
+			if tracingEnabled {
+				span.SetStatus(codes.Error, "context cancelled")
+				span.End()
+			}
 			return
 		}
 	})
 	if err != nil {
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to subscribe")
+			span.End()
+		}
 		return nil, fmt.Errorf("failed to subscribe: %w", err)
 	}
 
 	// Notify server of stream initialization
 	header := nats.Header{}
 	header.Set("Stream-ID", streamID)
+	
+	// Inject trace context
+	injectTraceContext(ctx, header)
+	
 	if err := c.nc.PublishMsg(&nats.Msg{
 		Subject: "{{.Topic}}.init",
 		Header:  header,
 	}); err != nil {
 		sub.Unsubscribe()
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to initialize stream")
+			span.End()
+		}
 		return nil, fmt.Errorf("failed to initialize stream: %w", err)
 	}
 
@@ -487,6 +741,7 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 		errCh:    errCh,
 		sub:      sub,
 		ctx:      ctx,
+		span:     span,
 		seqNum:   0,
 	}, nil
 }
@@ -498,18 +753,36 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 {{if isUnary .}}
 	// {{.Name}} - Unary RPC
 	if _, err := nc.Subscribe("{{.Topic}}", func(msg *nats.Msg) {
+		// Extract trace context from headers if tracing is enabled
+		ctx := extractTraceContext(context.Background(), msg.Header)
+		
+		// Start server span if tracing is enabled
+		ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
+			trace.SpanKindServer,
+			attribute.String("rpc.system", "nats"),
+			attribute.String("rpc.service", "{{.ServiceName}}"),
+			attribute.String("rpc.method", "{{.Name}}"),
+		)
+		defer span.End()
+
 		req := &{{.InputTypeName}}{}
 		if err := proto.Unmarshal(msg.Data, req); err != nil {
-			// Send error response
+			if tracingEnabled {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "failed to unmarshal request")
+			}
 			errHeader := nats.Header{}
 			errHeader.Set("X-Error", fmt.Sprintf("failed to unmarshal request: %v", err))
 			msg.RespondMsg(&nats.Msg{Header: errHeader})
 			return
 		}
 
-		resp, err := srv.{{.Name}}(context.Background(), req)
+		resp, err := srv.{{.Name}}(ctx, req)
 		if err != nil {
-			// Send error response
+			if tracingEnabled {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+			}
 			errHeader := nats.Header{}
 			errHeader.Set("X-Error", err.Error())
 			msg.RespondMsg(&nats.Msg{Header: errHeader})
@@ -518,12 +791,19 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 
 		data, err := proto.Marshal(resp)
 		if err != nil {
+			if tracingEnabled {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "failed to marshal response")
+			}
 			errHeader := nats.Header{}
 			errHeader.Set("X-Error", fmt.Sprintf("failed to marshal response: %v", err))
 			msg.RespondMsg(&nats.Msg{Header: errHeader})
 			return
 		}
 
+		if tracingEnabled {
+			span.SetStatus(codes.Ok, "")
+		}
 		msg.Respond(data)
 	}); err != nil {
 		return err
@@ -531,9 +811,25 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 {{else if isServerStreaming .}}
 	// {{.Name}} - Server streaming RPC
 	if _, err := nc.Subscribe("{{.Topic}}", func(msg *nats.Msg) {
+		// Extract trace context
+		ctx := extractTraceContext(context.Background(), msg.Header)
+		
+		// Start server span
+		ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
+			trace.SpanKindServer,
+			attribute.String("rpc.system", "nats"),
+			attribute.String("rpc.service", "{{.ServiceName}}"),
+			attribute.String("rpc.method", "{{.Name}}"),
+			attribute.String("stream.type", "server"),
+		)
+		defer span.End()
+
 		req := &{{.InputTypeName}}{}
 		if err := proto.Unmarshal(msg.Data, req); err != nil {
-			// Send error
+			if tracingEnabled {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "failed to unmarshal request")
+			}
 			errHeader := nats.Header{}
 			errHeader.Set("X-Error", fmt.Sprintf("failed to unmarshal request: %v", err))
 			errHeader.Set("Stream-EOF", "true")
@@ -550,7 +846,10 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 		}
 
 		if err := srv.{{.Name}}(req, stream); err != nil {
-			// Send error and EOF
+			if tracingEnabled {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+			}
 			errHeader := nats.Header{}
 			errHeader.Set("X-Error", err.Error())
 			errHeader.Set("Stream-EOF", "true")
@@ -561,7 +860,9 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 			return
 		}
 
-		// Send EOF
+		if tracingEnabled {
+			span.SetStatus(codes.Ok, "")
+		}
 		stream.Close()
 	}); err != nil {
 		return err
@@ -590,7 +891,6 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 		}
 		streamAggregator.mu.Unlock()
 
-		// Unmarshal and store message
 		in := &{{.InputTypeName}}{}
 		if err := proto.Unmarshal(msg.Data, in); err != nil {
 			return
@@ -607,6 +907,19 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 	if _, err := nc.Subscribe("{{.Topic}}.close", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
 		
+		// Extract trace context
+		ctx := extractTraceContext(context.Background(), msg.Header)
+		
+		// Start server span
+		ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
+			trace.SpanKindServer,
+			attribute.String("rpc.system", "nats"),
+			attribute.String("rpc.service", "{{.ServiceName}}"),
+			attribute.String("rpc.method", "{{.Name}}"),
+			attribute.String("stream.type", "client"),
+		)
+		defer span.End()
+
 		streamAggregator.mu.Lock()
 		buf := streamAggregator.streams[streamID]
 		delete(streamAggregator.streams, streamID)
@@ -616,14 +929,20 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 			return
 		}
 
-		// Process stream
+		if tracingEnabled {
+			span.SetAttributes(attribute.Int("stream.messages_received", len(buf.messages)))
+		}
+
 		stream := &{{streamImplType .ServiceName .Name "Server"}}{
 			messages: buf.messages,
 			index:    0,
 		}
 
 		if err := srv.{{.Name}}(stream); err != nil {
-			// Send error response
+			if tracingEnabled {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+			}
 			errHeader := nats.Header{}
 			errHeader.Set("X-Error", err.Error())
 			nc.PublishMsg(&nats.Msg{
@@ -633,7 +952,10 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 			return
 		}
 
-		// Send final response
+		if tracingEnabled {
+			span.SetStatus(codes.Ok, "")
+		}
+
 		if stream.response != nil {
 			data, _ := proto.Marshal(stream.response)
 			nc.Publish(buf.responseSubject, data)
@@ -653,6 +975,18 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 	if _, err := nc.Subscribe("{{.Topic}}.init", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
 		
+		// Extract trace context
+		ctx := extractTraceContext(context.Background(), msg.Header)
+		
+		// Start server span
+		ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
+			trace.SpanKindServer,
+			attribute.String("rpc.system", "nats"),
+			attribute.String("rpc.service", "{{.ServiceName}}"),
+			attribute.String("rpc.method", "{{.Name}}"),
+			attribute.String("stream.type", "bidirectional"),
+		)
+		
 		stream := &{{.ServiceName}}_{{.Name}}_ServerStream{
 			nc:          nc,
 			streamID:    streamID,
@@ -664,10 +998,14 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 		streamManager.streams[streamID] = stream
 		streamManager.mu.Unlock()
 
-		// Start handler
 		go func() {
+			defer span.End()
+			
 			if err := srv.{{.Name}}(stream); err != nil {
-				// Send error
+				if tracingEnabled {
+					span.RecordError(err)
+					span.SetStatus(codes.Error, err.Error())
+				}
 				errHeader := nats.Header{}
 				errHeader.Set("X-Error", err.Error())
 				errHeader.Set("Stream-EOF", "true")
@@ -675,6 +1013,10 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 					Subject: stream.sendSubject,
 					Header:  errHeader,
 				})
+			} else {
+				if tracingEnabled {
+					span.SetStatus(codes.Ok, "")
+				}
 			}
 			stream.Close()
 		}()
@@ -775,6 +1117,7 @@ type {{streamImplType .ServiceName .Name "Client"}} struct {
 	recvCh chan {{.OutputType}}
 	errCh  chan error
 	ctx    context.Context
+	span   trace.Span
 	mu     sync.Mutex
 	closed bool
 }
@@ -802,6 +1145,11 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 	}
 
 	s.closed = true
+	
+	if tracingEnabled && s.span.IsRecording() {
+		s.span.End()
+	}
+	
 	return s.sub.Unsubscribe()
 }
 `))
@@ -820,7 +1168,9 @@ type {{streamImplType .ServiceName .Name "Client"}} struct {
 	topic       string
 	responseSub *nats.Subscription
 	ctx         context.Context
+	span        trace.Span
 	seqNum      uint64
+	sentCount   int
 	mu          sync.Mutex
 	closed      bool
 }
@@ -842,6 +1192,7 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) Send(msg {{.InputType}}
 	header.Set("Stream-ID", s.streamID)
 	header.Set("Seq-Num", strconv.FormatUint(s.seqNum, 10))
 	s.seqNum++
+	s.sentCount++
 
 	return s.nc.PublishMsg(&nats.Msg{
 		Subject: s.topic,
@@ -853,6 +1204,7 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) Send(msg {{.InputType}}
 func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseAndRecv() ({{.OutputType}}, error) {
 	s.mu.Lock()
 	s.closed = true
+	sentCount := s.sentCount
 	s.mu.Unlock()
 
 	// Send close signal
@@ -863,23 +1215,50 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseAndRecv() ({{.Outp
 		Subject: s.topic + ".close",
 		Header:  header,
 	}); err != nil {
+		if tracingEnabled && s.span.IsRecording() {
+			s.span.RecordError(err)
+			s.span.SetStatus(codes.Error, "failed to close stream")
+			s.span.End()
+		}
 		return nil, fmt.Errorf("failed to close stream: %w", err)
 	}
 
 	// Wait for final response
 	msg, err := s.responseSub.NextMsgWithContext(s.ctx)
 	if err != nil {
+		if tracingEnabled && s.span.IsRecording() {
+			s.span.RecordError(err)
+			s.span.SetStatus(codes.Error, "failed to receive response")
+			s.span.End()
+		}
 		return nil, fmt.Errorf("failed to receive response: %w", err)
 	}
 
 	// Check for error
 	if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
-		return nil, fmt.Errorf("server error: %s", errMsg)
+		err := fmt.Errorf("server error: %s", errMsg)
+		if tracingEnabled && s.span.IsRecording() {
+			s.span.RecordError(err)
+			s.span.SetStatus(codes.Error, errMsg)
+			s.span.End()
+		}
+		return nil, err
 	}
 
 	out := &{{.OutputTypeName}}{}
 	if err := proto.Unmarshal(msg.Data, out); err != nil {
+		if tracingEnabled && s.span.IsRecording() {
+			s.span.RecordError(err)
+			s.span.SetStatus(codes.Error, "failed to unmarshal response")
+			s.span.End()
+		}
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if tracingEnabled && s.span.IsRecording() {
+		s.span.SetAttributes(attribute.Int("stream.messages_sent", sentCount))
+		s.span.SetStatus(codes.Ok, "")
+		s.span.End()
 	}
 
 	s.responseSub.Unsubscribe()
@@ -952,6 +1331,7 @@ type {{streamImplType .ServiceName .Name "Client"}} struct {
 	errCh    chan error
 	sub      *nats.Subscription
 	ctx      context.Context
+	span     trace.Span
 	seqNum   uint64
 	mu       sync.Mutex
 	closed   bool
@@ -1013,6 +1393,11 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 		Subject: s.topic + ".close",
 		Header:  header,
 	})
+
+	if tracingEnabled && s.span.IsRecording() {
+		s.span.SetStatus(codes.Ok, "")
+		s.span.End()
+	}
 
 	s.sub.Unsubscribe()
 	close(s.recvCh)
