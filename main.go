@@ -752,7 +752,7 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 {{if isUnary .}}
 	// {{.Name}} - Unary RPC
-	if _, err := nc.Subscribe("{{.Topic}}", func(msg *nats.Msg) {
+	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		// Extract trace context from headers if tracing is enabled
 		ctx := extractTraceContext(context.Background(), msg.Header)
 		
@@ -810,7 +810,7 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 	}
 {{else if isServerStreaming .}}
 	// {{.Name}} - Server streaming RPC
-	if _, err := nc.Subscribe("{{.Topic}}", func(msg *nats.Msg) {
+	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		// Extract trace context
 		ctx := extractTraceContext(context.Background(), msg.Header)
 		
@@ -875,8 +875,8 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 		streams: make(map[string]*{{.ServiceName}}_{{.Name}}_StreamBuffer),
 	}
 
-	// Subscribe to data messages
-	if _, err := nc.Subscribe("{{.Topic}}", func(msg *nats.Msg) {
+	// Subscribe to data messages with queue group
+	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
 		seqNum := msg.Header.Get("Seq-Num")
 		
@@ -903,8 +903,8 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 		return err
 	}
 
-	// Subscribe to close signal
-	if _, err := nc.Subscribe("{{.Topic}}.close", func(msg *nats.Msg) {
+	// Subscribe to close signal with queue group
+	if _, err := nc.QueueSubscribe("{{.Topic}}.close", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
 		
 		// Extract trace context
@@ -971,8 +971,8 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 		streams: make(map[string]*{{.ServiceName}}_{{.Name}}_ServerStream),
 	}
 
-	// Subscribe to init
-	if _, err := nc.Subscribe("{{.Topic}}.init", func(msg *nats.Msg) {
+	// Subscribe to init with queue group
+	if _, err := nc.QueueSubscribe("{{.Topic}}.init", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
 		
 		// Extract trace context
@@ -1024,8 +1024,8 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 		return err
 	}
 
-	// Subscribe to data
-	if _, err := nc.Subscribe("{{.Topic}}.in", func(msg *nats.Msg) {
+	// Subscribe to data with queue group
+	if _, err := nc.QueueSubscribe("{{.Topic}}.in", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
 		
 		streamManager.mu.RLock()
@@ -1049,8 +1049,8 @@ var _ = template.Must(fileTemplate.New("serverMethodRegistration").Parse(`
 		return err
 	}
 
-	// Subscribe to close
-	if _, err := nc.Subscribe("{{.Topic}}.close", func(msg *nats.Msg) {
+	// Subscribe to close with queue group
+	if _, err := nc.QueueSubscribe("{{.Topic}}.close", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
 		
 		streamManager.mu.Lock()
