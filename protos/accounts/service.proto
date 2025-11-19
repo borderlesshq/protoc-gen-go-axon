@@ -2,9 +2,9 @@ syntax = "proto3";
 package accounts;
 option go_package = ".;accounts";
 
-import "definitions.proto";
-import "accounts.proto";
-import "wallet.proto";
+import "accounts/definitions.proto";
+import "accounts/accounts.proto";
+import "accounts/wallet.proto";
 
 
 service AccountService {
@@ -20,6 +20,8 @@ service AccountService {
   rpc CreateVirtualAccount(CreateVirtualAccountRequest) returns (Account);
   rpc GetAccount(GetByIdRequest) returns (Account);
   rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
+
+  rpc StreamWalletUpdates(stream GetByIdRequest) returns (stream Wallet);
 //  rpc CreditAccount(CreditAccountRequest) returns (CreditAccountResponse);
 //  rpc DebitAccount(DebitAccountRequest) returns (DebitAccountResponse);
 }

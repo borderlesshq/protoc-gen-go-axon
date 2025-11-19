@@ -11,13 +11,8 @@ endif
 
 GO_SOURCES_OWN := $(filter-out outlet/%, $(GO_SOURCES))
 
-# Proto configuration
-PROTO_SRC_BASE := ${PWD}/protos
-PROTO_DST_BASE := ${PWD}/contracts
 
-# Automatically discover all proto directories under protos/
-# This will find: protos/accounts, protos/cards, etc.
-PROTO_ENTITIES := $(shell find $(PROTO_SRC_BASE) -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+
 
 
 vet:
@@ -41,6 +36,14 @@ alignment:
 # ============================================================================
 # Protocol Buffers Generation
 # ============================================================================
+# Proto configuration
+# Proto configuration
+PROTO_SRC_BASE := ${PWD}/protos
+PROTO_DST_BASE := ${PWD}/contracts
+# Automatically discover all proto directories under protos/
+# This will find: protos/accounts, protos/cards, etc.
+PROTO_ENTITIES := $(shell find $(PROTO_SRC_BASE) -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+GO_MODULE := $(shell go list -m | head -n 1)
 
 .PHONY: clean-proto clean-proto-generated clean-proto-plugins install-proto-plugins proto protos list-protos
 
@@ -65,7 +68,7 @@ clean-proto: clean-proto-generated clean-proto-plugins
 install-proto-plugins:
 	@echo "📦 Installing protoc plugins..."
 	@go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	@go install github.com/borderlesshq/protoc-gen-go-axon@latest
+	@go install github.com/borderlesshq/protoc-gen-go-axon@v1.0.0
 	@echo "✓ Plugins installed"
 
 # List all available proto entities
@@ -75,38 +78,18 @@ list-protos:
 		echo "  - $$entity"; \
 	done
 
-# Generate protos for ALL entities
-# Usage: make protos
-protos: clean-proto-generated install-proto-plugins
-	@echo "🔄 Generating protos for all entities..."
-	@for entity in $(PROTO_ENTITIES); do \
-		echo ""; \
-		echo "📝 Processing: $$entity"; \
-		PROTO_SRC_DIR=$(PROTO_SRC_BASE)/$$entity; \
-		PROTO_DST_DIR=$(PROTO_DST_BASE)/$$entity; \
-		echo "   Source: $$PROTO_SRC_DIR"; \
-		echo "   Output: $$PROTO_DST_DIR"; \
-		mkdir -p $$PROTO_DST_DIR; \
-		if [ -n "$$(find $$PROTO_SRC_DIR -name '*.proto' -type f 2>/dev/null)" ]; then \
-			protoc \
-				-I=$$PROTO_SRC_DIR \
-				--go_out=$$PROTO_DST_DIR \
-				--go_opt=paths=source_relative \
-				--go-axon_out=$$PROTO_DST_DIR \
-				--go-axon_opt=paths=source_relative \
-				$$PROTO_SRC_DIR/*.proto && \
-			echo "   ✓ Generated $$entity successfully" || \
-			echo "   ✗ Failed to generate $$entity"; \
-		else \
-			echo "   ⚠ No .proto files found in $$PROTO_SRC_DIR"; \
-		fi; \
-	done
-	@echo ""
-	@echo "✅ All protos generated"
+define build-proto-mappings
+PROTO_MAPPINGS=""; \
+for e in $(PROTO_ENTITIES); do \
+	for proto in $$(find $(PROTO_SRC_BASE)/$$e -name '*.proto' -type f 2>/dev/null); do \
+		proto_rel=$$(echo $$proto | sed "s|$(PROTO_SRC_BASE)/||"); \
+		PROTO_MAPPINGS="$$PROTO_MAPPINGS,M$$proto_rel=$(GO_MODULE)/contracts/$$e"; \
+	done; \
+done; \
+PROTO_MAPPINGS=$$(echo "$$PROTO_MAPPINGS" | sed 's/^,//')
+endef
 
 # Generate proto for a SPECIFIC entity
-# Usage: make proto ENTITY=accounts
-# or:    make proto-accounts (using helper targets below)
 proto: install-proto-plugins
 	@if [ -z "$(ENTITY)" ]; then \
 		echo "❌ Error: ENTITY not specified"; \
@@ -119,6 +102,7 @@ proto: install-proto-plugins
 		exit 1; \
 	fi
 	@echo "🔄 Generating proto for entity: $(ENTITY)"
+	@echo "   Module: $(GO_MODULE)"
 	@PROTO_SRC_DIR=$(PROTO_SRC_BASE)/$(ENTITY); \
 	PROTO_DST_DIR=$(PROTO_DST_BASE)/$(ENTITY); \
 	if [ ! -d "$$PROTO_SRC_DIR" ]; then \
@@ -128,13 +112,16 @@ proto: install-proto-plugins
 	echo "   Source: $$PROTO_SRC_DIR"; \
 	echo "   Output: $$PROTO_DST_DIR"; \
 	mkdir -p $$PROTO_DST_DIR; \
+	@$(build-proto-mappings); \
 	if [ -n "$$(find $$PROTO_SRC_DIR -name '*.proto' -type f 2>/dev/null)" ]; then \
 		protoc \
-			-I=$$PROTO_SRC_DIR \
-			--go_out=$$PROTO_DST_DIR \
+			-I=$(PROTO_SRC_BASE) \
+			--go_out=$(PROTO_DST_BASE) \
 			--go_opt=paths=source_relative \
-			--go-axon_out=$$PROTO_DST_DIR \
+			--go_opt=$$PROTO_MAPPINGS \
+			--go-axon_out=$(PROTO_DST_BASE) \
 			--go-axon_opt=paths=source_relative \
+			--go-axon_opt=$$PROTO_MAPPINGS \
 			$$PROTO_SRC_DIR/*.proto && \
 		echo "✅ Generated $(ENTITY) successfully" || \
 		(echo "❌ Failed to generate $(ENTITY)"; exit 1); \
@@ -143,10 +130,38 @@ proto: install-proto-plugins
 		exit 1; \
 	fi
 
-# ============================================================================
-# Convenience targets for specific entities
-# These let you do: make proto-accounts instead of make proto ENTITY=accounts
-# ============================================================================
+# Generate protos for ALL entities
+protos: clean-proto-generated install-proto-plugins
+	@echo "🔄 Generating protos for all entities..."
+	@echo "   Module: $(GO_MODULE)"
+	@echo "   Building import mappings..."
+	@$(build-proto-mappings); \
+	for entity in $(PROTO_ENTITIES); do \
+		echo ""; \
+		echo "📝 Processing: $$entity"; \
+		PROTO_SRC_DIR=$(PROTO_SRC_BASE)/$$entity; \
+		PROTO_DST_DIR=$(PROTO_DST_BASE)/$$entity; \
+		echo "   Source: $$PROTO_SRC_DIR"; \
+		echo "   Output: $$PROTO_DST_DIR"; \
+		mkdir -p $$PROTO_DST_DIR; \
+		if [ -n "$$(find $$PROTO_SRC_DIR -name '*.proto' -type f 2>/dev/null)" ]; then \
+			protoc \
+				-I=$(PROTO_SRC_BASE) \
+				--go_out=$(PROTO_DST_BASE) \
+				--go_opt=paths=source_relative \
+				--go_opt=$$PROTO_MAPPINGS \
+				--go-axon_out=$(PROTO_DST_BASE) \
+				--go-axon_opt=paths=source_relative \
+				--go-axon_opt=$$PROTO_MAPPINGS \
+				$$PROTO_SRC_DIR/*.proto && \
+			echo "   ✓ Generated $$entity successfully" || \
+			echo "   ✗ Failed to generate $$entity"; \
+		else \
+			echo "   ⚠ No .proto files found in $$PROTO_SRC_DIR"; \
+		fi; \
+	done
+	@echo ""
+	@echo "✅ All protos generated"
 
 # Dynamically create proto-<entity> targets for each discovered entity
 # This allows: make proto-accounts, make proto-cards, etc.

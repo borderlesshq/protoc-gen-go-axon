@@ -2,9 +2,9 @@ syntax = "proto3";
 package accounts;
 option go_package = ".;accounts";
 
-import "definitions.proto";
-import "accounts.proto";
-import "wallet.proto";
+import "cards/definitions.proto";
+import "cards/accounts.proto";
+import "cards/wallet.proto";
 
 
 service AccountService {
@@ -13,16 +13,19 @@ service AccountService {
   rpc ListWallets(ListWalletsRequest) returns (ListWalletsResponse);
   rpc SetWalletPin(SetWalletPinRequest) returns (RemarksResponse);
   rpc ConfirmSetWalletPin(ConfirmSetWalletPinRequest) returns (RemarksResponse);
-//  rpc CreditWallet(CreditWalletRequest) returns (CreditWalletResponse);
+  //  rpc CreditWallet(CreditWalletRequest) returns (CreditWalletResponse);
 
 
   rpc CreateStaticAccount(CreateStaticAccountRequest) returns (Account);
   rpc CreateVirtualAccount(CreateVirtualAccountRequest) returns (Account);
   rpc GetAccount(GetByIdRequest) returns (Account);
   rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
-//  rpc CreditAccount(CreditAccountRequest) returns (CreditAccountResponse);
-//  rpc DebitAccount(DebitAccountRequest) returns (DebitAccountResponse);
+
+  rpc StreamWalletUpdates(stream GetByIdRequest) returns (stream Wallet);
+  //  rpc CreditAccount(CreditAccountRequest) returns (CreditAccountResponse);
+  //  rpc DebitAccount(DebitAccountRequest) returns (DebitAccountResponse);
 }
+
 
 
 
