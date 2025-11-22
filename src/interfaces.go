@@ -1087,7 +1087,7 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) startHealthMonitor() {
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
 		for {
@@ -1101,7 +1101,7 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) startHealthMonitor() {
 				lastActivity := atomic.LoadInt64(&s.lastActivityNano)
 				if lastActivity > 0 {
 					elapsed := time.Since(time.Unix(0, lastActivity))
-					if elapsed > 30*time.Second {
+					if elapsed > 3*time.Second {
 						// No activity for 30 seconds, attempt reconnection
 						if err := s.reconnect(); err != nil {
 							// If reconnection fails, report error
@@ -1485,7 +1485,7 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) startHealthMonitor() {
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
 		for {
@@ -1499,7 +1499,7 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) startHealthMonitor() {
 				lastActivity := atomic.LoadInt64(&s.lastActivityNano)
 				if lastActivity > 0 {
 					elapsed := time.Since(time.Unix(0, lastActivity))
-					if elapsed > 30*time.Second {
+					if elapsed > 3*time.Second {
 						// No activity for 30 seconds, attempt reconnection
 						if err := s.reconnect(); err != nil {
 							// If reconnection fails, report error
