@@ -404,6 +404,7 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 		requestHeaders: requestHeaders,
 		topic:          "{{.Topic}}",
 		lastSeqNum:     0,
+		stopMonitor:    make(chan struct{}),
 	}
 
 	// Subscribe to stream responses
@@ -419,6 +420,9 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 		return nil, fmt.Errorf("failed to subscribe: %w", err)
 	}
 	stream.sub = sub
+
+	// Start health monitoring for automatic reconnection
+	stream.startHealthMonitor()
 
 	// Send initial request with reply-to inbox
 	if err := c.nc.PublishMsg(&nats.Msg{
@@ -512,14 +516,15 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 	errCh := make(chan error, 1)
 
 	stream := &{{streamImplType .ServiceName .Name "Client"}}{
-		nc:       c.nc,
-		streamID: streamID,
-		topic:    "{{.Topic}}",
-		recvCh:   recvCh,
-		errCh:    errCh,
-		ctx:      ctx,
-		span:     span,
-		seqNum:   0,
+		nc:          c.nc,
+		streamID:    streamID,
+		topic:       "{{.Topic}}",
+		recvCh:      recvCh,
+		errCh:       errCh,
+		ctx:         ctx,
+		span:        span,
+		seqNum:      0,
+		stopMonitor: make(chan struct{}),
 	}
 
 	// Subscribe to receive stream
@@ -535,6 +540,9 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 		return nil, fmt.Errorf("failed to subscribe: %w", err)
 	}
 	stream.sub = sub
+
+	// Start health monitoring for automatic reconnection
+	stream.startHealthMonitor()
 
 	// Notify server of stream initialization
 	header := nats.Header{}
@@ -975,20 +983,22 @@ type {{streamType .ServiceName .Name "Client"}} interface {
 }
 
 type {{streamImplType .ServiceName .Name "Client"}} struct {
-	nc             *nats.Conn
-	sub            *nats.Subscription
-	recvCh         chan {{.OutputType}}
-	errCh          chan error
-	ctx            context.Context
-	span           trace.Span
-	mu             sync.Mutex
-	closed         bool
-	lastSeqNum     uint64
-	reconnecting   bool
-	inbox          string
-	requestData    []byte
-	requestHeaders nats.Header
-	topic          string
+	nc               *nats.Conn
+	sub              *nats.Subscription
+	recvCh           chan {{.OutputType}}
+	errCh            chan error
+	ctx              context.Context
+	span             trace.Span
+	mu               sync.Mutex
+	closed           bool
+	lastSeqNum       uint64
+	reconnecting     bool
+	inbox            string
+	requestData      []byte
+	requestHeaders   nats.Header
+	topic            string
+	lastActivityNano int64 // atomic access only
+	stopMonitor      chan struct{}
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) Recv() ({{.OutputType}}, error) {
@@ -1014,6 +1024,11 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 	}
 
 	s.closed = true
+
+	// Stop health monitor
+	if s.stopMonitor != nil {
+		close(s.stopMonitor)
+	}
 
 	if tracingEnabled && s.span.IsRecording() {
 		s.span.End()
@@ -1070,7 +1085,42 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
 	return nil
 }
 
+func (s *{{streamImplType .ServiceName .Name "Client"}}) startHealthMonitor() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-s.stopMonitor:
+				return
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				// Check if we've received any activity in the last 30 seconds
+				lastActivity := atomic.LoadInt64(&s.lastActivityNano)
+				if lastActivity > 0 {
+					elapsed := time.Since(time.Unix(0, lastActivity))
+					if elapsed > 30*time.Second {
+						// No activity for 30 seconds, attempt reconnection
+						if err := s.reconnect(); err != nil {
+							// If reconnection fails, report error
+							select {
+							case s.errCh <- fmt.Errorf("auto-reconnect failed: %w", err):
+							default:
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
+}
+
 func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg *nats.Msg) {
+	// Update activity timestamp atomically (lock-free)
+	atomic.StoreInt64(&s.lastActivityNano, time.Now().UnixNano())
+
 	// Check for EOF signal
 	if msg.Header.Get("Stream-EOF") == "true" {
 		if tracingEnabled {
@@ -1301,19 +1351,21 @@ type {{streamType .ServiceName .Name "Client"}} interface {
 }
 
 type {{streamImplType .ServiceName .Name "Client"}} struct {
-	nc           *nats.Conn
-	streamID     string
-	topic        string
-	recvCh       chan {{.OutputType}}
-	errCh        chan error
-	sub          *nats.Subscription
-	ctx          context.Context
-	span         trace.Span
-	seqNum       uint64
-	lastRecvSeq  uint64
-	mu           sync.Mutex
-	closed       bool
-	reconnecting bool
+	nc               *nats.Conn
+	streamID         string
+	topic            string
+	recvCh           chan {{.OutputType}}
+	errCh            chan error
+	sub              *nats.Subscription
+	ctx              context.Context
+	span             trace.Span
+	seqNum           uint64
+	lastRecvSeq      uint64
+	mu               sync.Mutex
+	closed           bool
+	reconnecting     bool
+	lastActivityNano int64 // atomic access only
+	stopMonitor      chan struct{}
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) Send(msg {{.InputType}}) error {
@@ -1364,6 +1416,11 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 	}
 
 	s.closed = true
+
+	// Stop health monitor
+	if s.stopMonitor != nil {
+		close(s.stopMonitor)
+	}
 
 	header := nats.Header{}
 	header.Set("Stream-ID", s.streamID)
@@ -1426,7 +1483,42 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
 	return nil
 }
 
+func (s *{{streamImplType .ServiceName .Name "Client"}}) startHealthMonitor() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-s.stopMonitor:
+				return
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				// Check if we've received any activity in the last 30 seconds
+				lastActivity := atomic.LoadInt64(&s.lastActivityNano)
+				if lastActivity > 0 {
+					elapsed := time.Since(time.Unix(0, lastActivity))
+					if elapsed > 30*time.Second {
+						// No activity for 30 seconds, attempt reconnection
+						if err := s.reconnect(); err != nil {
+							// If reconnection fails, report error
+							select {
+							case s.errCh <- fmt.Errorf("auto-reconnect failed: %w", err):
+							default:
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
+}
+
 func (s *{{streamImplType .ServiceName .Name "Client"}}) handleRecvMessage(msg *nats.Msg) {
+	// Update activity timestamp atomically (lock-free)
+	atomic.StoreInt64(&s.lastActivityNano, time.Now().UnixNano())
+
 	// Check for EOF
 	if msg.Header.Get("Stream-EOF") == "true" {
 		if tracingEnabled {
