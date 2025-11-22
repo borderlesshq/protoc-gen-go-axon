@@ -183,7 +183,7 @@ func WithHeader(key, value string) CallOption {
 
 
 
-{{template "serverInterceptors" .}}
+{{template "serviceRegistry" .}}
 
 {{range .Services}}
 {{template "serverInterface" .}}
