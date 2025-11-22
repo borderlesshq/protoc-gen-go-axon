@@ -25,12 +25,20 @@ type {{.Name}}Client interface {
 // Client implementation template
 var _ = template.Must(FileTemplate.New("clientImpl").Parse(`
 type {{clientType .Name}} struct {
-	nc *nats.Conn
+	nc   *nats.Conn
+	opts clientOptions
 }
 
 // New{{.Name}}Client creates a new client for {{.Name}}
-func New{{.Name}}Client(nc *nats.Conn) {{.Name}}Client {
-	return &{{clientType .Name}}{nc: nc}
+func New{{.Name}}Client(nc *nats.Conn, opts ...ClientOption) {{.Name}}Client {
+	clientOpts := defaultClientOptions()
+	for _, opt := range opts {
+		opt(clientOpts)
+	}
+	return &{{clientType .Name}}{
+		nc:   nc,
+		opts: *clientOpts,
+	}
 }
 
 {{range .Methods}}
@@ -74,7 +82,12 @@ func Register{{.Name}}Server(nc *nats.Conn, srv {{.Name}}Server, opts ...ServerO
 	if err := s.registerService(&{{.Name}}_ServiceDesc, srv); err != nil {
 		return nil, err
 	}
-	
+
+	// Register streaming method subscriptions
+	if err := _register{{.Name}}StreamHandlers(s.nc, srv); err != nil {
+		return nil, err
+	}
+
 	return s, nil
 }
 
@@ -83,8 +96,23 @@ func Register{{.Name}}ServerWithServer(s *Server, srv {{.Name}}Server) (*Server,
 	if err := s.registerService(&{{.Name}}_ServiceDesc, srv); err != nil {
 		return nil, err
 	}
-	
+
+	// Register streaming method subscriptions
+	if err := _register{{.Name}}StreamHandlers(s.nc, srv); err != nil {
+		return nil, err
+	}
+
 	return s, nil
+}
+
+// _register{{.Name}}StreamHandlers sets up NATS subscriptions for streaming methods
+func _register{{.Name}}StreamHandlers(nc *nats.Conn, srv {{.Name}}Server) error {
+{{range .Methods}}
+{{if not (isUnary .)}}
+{{template "serverMethodRegistration" .}}
+{{end}}
+{{end}}
+	return nil
 }
 
 {{range .Methods}}
@@ -230,6 +258,31 @@ var _ = template.Must(FileTemplate.New("clientMethodSignature").Parse(`
 var _ = template.Must(FileTemplate.New("clientMethod").Parse(`
 {{if isUnary .}}
 func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.InputType}}, opts ...CallOption) ({{.OutputType}}, error) {
+	// If interceptor is configured, use it
+	if c.opts.unaryInt != nil {
+		info := &UnaryClientInfo{
+			FullMethod: "{{.ServiceName}}.{{.Name}}",
+		}
+
+		invoker := func(ctx context.Context, method string, req, reply interface{}, opts ...CallOption) error {
+			out, err := c.{{.Name}}Invoke(ctx, req.({{.InputType}}), opts...)
+			if err != nil {
+				return err
+			}
+			*(reply.({{.OutputType}})) = *out
+			return nil
+		}
+
+		out := &{{.OutputTypeName}}{}
+		err := c.opts.unaryInt(ctx, "{{.ServiceName}}.{{.Name}}", in, out, info, invoker, opts...)
+		return out, err
+	}
+
+	return c.{{.Name}}Invoke(ctx, in, opts...)
+}
+
+// {{.Name}}Invoke performs the actual unary RPC invocation
+func (c *{{clientType .ServiceName}}) {{.Name}}Invoke(ctx context.Context, in {{.InputType}}, opts ...CallOption) ({{.OutputType}}, error) {
 	// Start tracing span if enabled
 	ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
 		trace.SpanKindClient,

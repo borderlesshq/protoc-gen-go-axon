@@ -68,7 +68,7 @@ clean-proto: clean-proto-generated clean-proto-plugins
 install-proto-plugins:
 	@echo "📦 Installing protoc plugins..."
 	@go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	@go install . -o github.com/borderlesshq/protoc-gen-go-axon@v1.0.1
+	@go install . -o github.com/borderlesshq/protoc-gen-go-axon@v1.0.2
 	@#go build -o $(GOPATH)/bin/protoc-gen-go-axon .
 	@echo "✓ Plugins installed"
 
