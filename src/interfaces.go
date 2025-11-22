@@ -420,17 +420,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 	}
 	stream.sub = sub
 
-	// Set up inactivity timer for automatic reconnection
-	stream.noActivityTimer = time.AfterFunc(30*time.Second, func() {
-		// Attempt reconnection if no activity for 30 seconds
-		if err := stream.reconnect(); err != nil {
-			select {
-			case stream.errCh <- fmt.Errorf("reconnection failed: %w", err):
-			default:
-			}
-		}
-	})
-
 	// Send initial request with reply-to inbox
 	if err := c.nc.PublishMsg(&nats.Msg{
 		Subject: "{{.Topic}}",
@@ -439,7 +428,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 		Header:  requestHeaders,
 	}); err != nil {
 		sub.Unsubscribe()
-		stream.noActivityTimer.Stop()
 		if tracingEnabled {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "failed to publish request")
@@ -451,11 +439,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 	// Handle cleanup on context cancellation
 	go func() {
 		<-ctx.Done()
-		stream.mu.Lock()
-		if stream.noActivityTimer != nil {
-			stream.noActivityTimer.Stop()
-		}
-		stream.mu.Unlock()
 		sub.Unsubscribe()
 		if tracingEnabled && span.IsRecording() {
 			span.SetStatus(codes.Error, "context cancelled")
@@ -553,17 +536,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 	}
 	stream.sub = sub
 
-	// Set up inactivity timer for automatic reconnection
-	stream.noActivityTimer = time.AfterFunc(30*time.Second, func() {
-		// Attempt reconnection if no activity for 30 seconds
-		if err := stream.reconnect(); err != nil {
-			select {
-			case stream.errCh <- fmt.Errorf("reconnection failed: %w", err):
-			default:
-			}
-		}
-	})
-
 	// Notify server of stream initialization
 	header := nats.Header{}
 	header.Set("Stream-ID", streamID)
@@ -576,7 +548,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 		Header:  header,
 	}); err != nil {
 		sub.Unsubscribe()
-		stream.noActivityTimer.Stop()
 		if tracingEnabled {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "failed to initialize stream")
@@ -588,11 +559,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 	// Handle cleanup on context cancellation
 	go func() {
 		<-ctx.Done()
-		stream.mu.Lock()
-		if stream.noActivityTimer != nil {
-			stream.noActivityTimer.Stop()
-		}
-		stream.mu.Unlock()
 		sub.Unsubscribe()
 		if tracingEnabled && span.IsRecording() {
 			span.SetStatus(codes.Error, "context cancelled")
@@ -1009,21 +975,20 @@ type {{streamType .ServiceName .Name "Client"}} interface {
 }
 
 type {{streamImplType .ServiceName .Name "Client"}} struct {
-	nc              *nats.Conn
-	sub             *nats.Subscription
-	recvCh          chan {{.OutputType}}
-	errCh           chan error
-	ctx             context.Context
-	span            trace.Span
-	mu              sync.Mutex
-	closed          bool
-	lastSeqNum      uint64
-	reconnecting    bool
-	inbox           string
-	requestData     []byte
-	requestHeaders  nats.Header
-	topic           string
-	noActivityTimer *time.Timer
+	nc             *nats.Conn
+	sub            *nats.Subscription
+	recvCh         chan {{.OutputType}}
+	errCh          chan error
+	ctx            context.Context
+	span           trace.Span
+	mu             sync.Mutex
+	closed         bool
+	lastSeqNum     uint64
+	reconnecting   bool
+	inbox          string
+	requestData    []byte
+	requestHeaders nats.Header
+	topic          string
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) Recv() ({{.OutputType}}, error) {
@@ -1049,10 +1014,6 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 	}
 
 	s.closed = true
-
-	if s.noActivityTimer != nil {
-		s.noActivityTimer.Stop()
-	}
 
 	if tracingEnabled && s.span.IsRecording() {
 		s.span.End()
@@ -1110,13 +1071,6 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg *nats.Msg) {
-	// Reset inactivity timer
-	s.mu.Lock()
-	if s.noActivityTimer != nil {
-		s.noActivityTimer.Reset(30 * time.Second)
-	}
-	s.mu.Unlock()
-
 	// Check for EOF signal
 	if msg.Header.Get("Stream-EOF") == "true" {
 		if tracingEnabled {
@@ -1156,7 +1110,7 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg
 		return
 	}
 
-	// Track sequence number
+	// Track sequence number (no lock needed for atomic read/write)
 	if seqStr := msg.Header.Get("Seq-Num"); seqStr != "" {
 		if seq, err := strconv.ParseUint(seqStr, 10, 64); err == nil {
 			s.mu.Lock()
@@ -1347,20 +1301,19 @@ type {{streamType .ServiceName .Name "Client"}} interface {
 }
 
 type {{streamImplType .ServiceName .Name "Client"}} struct {
-	nc              *nats.Conn
-	streamID        string
-	topic           string
-	recvCh          chan {{.OutputType}}
-	errCh           chan error
-	sub             *nats.Subscription
-	ctx             context.Context
-	span            trace.Span
-	seqNum          uint64
-	lastRecvSeq     uint64
-	mu              sync.Mutex
-	closed          bool
-	reconnecting    bool
-	noActivityTimer *time.Timer
+	nc           *nats.Conn
+	streamID     string
+	topic        string
+	recvCh       chan {{.OutputType}}
+	errCh        chan error
+	sub          *nats.Subscription
+	ctx          context.Context
+	span         trace.Span
+	seqNum       uint64
+	lastRecvSeq  uint64
+	mu           sync.Mutex
+	closed       bool
+	reconnecting bool
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) Send(msg {{.InputType}}) error {
@@ -1411,10 +1364,6 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 	}
 
 	s.closed = true
-
-	if s.noActivityTimer != nil {
-		s.noActivityTimer.Stop()
-	}
 
 	header := nats.Header{}
 	header.Set("Stream-ID", s.streamID)
@@ -1478,13 +1427,6 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) handleRecvMessage(msg *nats.Msg) {
-	// Reset inactivity timer
-	s.mu.Lock()
-	if s.noActivityTimer != nil {
-		s.noActivityTimer.Reset(30 * time.Second)
-	}
-	s.mu.Unlock()
-
 	// Check for EOF
 	if msg.Header.Get("Stream-EOF") == "true" {
 		if tracingEnabled {
