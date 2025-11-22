@@ -386,58 +386,30 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 	recvCh := make(chan {{.OutputType}}, 10)
 	errCh := make(chan error, 1)
 
-	messageCount := 0
+	// Create request headers
+	requestHeaders := make(nats.Header)
+	injectTraceContext(ctx, requestHeaders)
+	for k, v := range callOpts.headers {
+		requestHeaders.Set(k, v)
+	}
+
+	stream := &{{streamImplType .ServiceName .Name "Client"}}{
+		nc:             c.nc,
+		recvCh:         recvCh,
+		errCh:          errCh,
+		ctx:            ctx,
+		span:           span,
+		inbox:          inbox,
+		requestData:    data,
+		requestHeaders: requestHeaders,
+		topic:          "{{.Topic}}",
+		lastSeqNum:     0,
+		stopMonitor:    make(chan struct{}),
+	}
+
 	// Subscribe to stream responses
 	sub, err := c.nc.Subscribe(inbox, func(msg *nats.Msg) {
-		// Check for EOF signal
-		if msg.Header.Get("Stream-EOF") == "true" {
-			if tracingEnabled {
-				span.SetAttributes(attribute.Int("stream.messages_received", messageCount))
-				span.SetStatus(codes.Ok, "")
-				span.End()
-			}
-			close(recvCh)
-			return
-		}
-
-		// Check for error
-		if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
-			err := fmt.Errorf("stream error: %s", errMsg)
-			if tracingEnabled {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, errMsg)
-				span.End()
-			}
-			select {
-			case errCh <- err:
-			default:
-			}
-			close(recvCh)
-			return
-		}
-
-		out := &{{.OutputTypeName}}{}
-		if err := proto.Unmarshal(msg.Data, out); err != nil {
-			if tracingEnabled {
-				span.RecordError(err)
-			}
-			select {
-			case errCh <- fmt.Errorf("unmarshal error: %w", err):
-			default:
-			}
-			return
-		}
-
-		messageCount++
-		select {
-		case recvCh <- out:
-		case <-ctx.Done():
-			if tracingEnabled {
-				span.SetStatus(codes.Error, "context cancelled")
-				span.End()
-			}
-			return
-		}
+		stream.handleStreamMessage(msg)
 	})
 	if err != nil {
 		if tracingEnabled {
@@ -447,25 +419,18 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 		}
 		return nil, fmt.Errorf("failed to subscribe: %w", err)
 	}
+	stream.sub = sub
 
-	// Create request message
-	msg := &nats.Msg{
+	// Start health monitoring for automatic reconnection
+	stream.startHealthMonitor()
+
+	// Send initial request with reply-to inbox
+	if err := c.nc.PublishMsg(&nats.Msg{
 		Subject: "{{.Topic}}",
 		Reply:   inbox,
 		Data:    data,
-		Header:  make(nats.Header),
-	}
-
-	// Inject trace context
-	injectTraceContext(ctx, msg.Header)
-
-	// Add custom headers
-	for k, v := range callOpts.headers {
-		msg.Header.Set(k, v)
-	}
-
-	// Send initial request with reply-to inbox
-	if err := c.nc.PublishMsg(msg); err != nil {
+		Header:  requestHeaders,
+	}); err != nil {
 		sub.Unsubscribe()
 		if tracingEnabled {
 			span.RecordError(err)
@@ -473,15 +438,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 			span.End()
 		}
 		return nil, fmt.Errorf("failed to publish request: %w", err)
-	}
-
-	stream := &{{streamImplType .ServiceName .Name "Client"}}{
-		nc:     c.nc,
-		sub:    sub,
-		recvCh: recvCh,
-		errCh:  errCh,
-		ctx:    ctx,
-		span:   span,
 	}
 
 	// Handle cleanup on context cancellation
@@ -559,55 +515,21 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 	recvCh := make(chan {{.OutputType}}, 10)
 	errCh := make(chan error, 1)
 
+	stream := &{{streamImplType .ServiceName .Name "Client"}}{
+		nc:          c.nc,
+		streamID:    streamID,
+		topic:       "{{.Topic}}",
+		recvCh:      recvCh,
+		errCh:       errCh,
+		ctx:         ctx,
+		span:        span,
+		seqNum:      0,
+		stopMonitor: make(chan struct{}),
+	}
+
 	// Subscribe to receive stream
 	sub, err := c.nc.Subscribe(streamID+".out", func(msg *nats.Msg) {
-		// Check for EOF
-		if msg.Header.Get("Stream-EOF") == "true" {
-			if tracingEnabled {
-				span.SetStatus(codes.Ok, "")
-				span.End()
-			}
-			close(recvCh)
-			return
-		}
-
-		// Check for error
-		if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
-			err := fmt.Errorf("stream error: %s", errMsg)
-			if tracingEnabled {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, errMsg)
-				span.End()
-			}
-			select {
-			case errCh <- err:
-			default:
-			}
-			close(recvCh)
-			return
-		}
-
-		out := &{{.OutputTypeName}}{}
-		if err := proto.Unmarshal(msg.Data, out); err != nil {
-			if tracingEnabled {
-				span.RecordError(err)
-			}
-			select {
-			case errCh <- fmt.Errorf("unmarshal error: %w", err):
-			default:
-			}
-			return
-		}
-
-		select {
-		case recvCh <- out:
-		case <-ctx.Done():
-			if tracingEnabled {
-				span.SetStatus(codes.Error, "context cancelled")
-				span.End()
-			}
-			return
-		}
+		stream.handleRecvMessage(msg)
 	})
 	if err != nil {
 		if tracingEnabled {
@@ -617,14 +539,18 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 		}
 		return nil, fmt.Errorf("failed to subscribe: %w", err)
 	}
+	stream.sub = sub
+
+	// Start health monitoring for automatic reconnection
+	stream.startHealthMonitor()
 
 	// Notify server of stream initialization
 	header := nats.Header{}
 	header.Set("Stream-ID", streamID)
-	
+
 	// Inject trace context
 	injectTraceContext(ctx, header)
-	
+
 	if err := c.nc.PublishMsg(&nats.Msg{
 		Subject: "{{.Topic}}.init",
 		Header:  header,
@@ -638,17 +564,18 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 		return nil, fmt.Errorf("failed to initialize stream: %w", err)
 	}
 
-	return &{{streamImplType .ServiceName .Name "Client"}}{
-		nc:       c.nc,
-		streamID: streamID,
-		topic:    "{{.Topic}}",
-		recvCh:   recvCh,
-		errCh:    errCh,
-		sub:      sub,
-		ctx:      ctx,
-		span:     span,
-		seqNum:   0,
-	}, nil
+	// Handle cleanup on context cancellation
+	go func() {
+		<-ctx.Done()
+		sub.Unsubscribe()
+		if tracingEnabled && span.IsRecording() {
+			span.SetStatus(codes.Error, "context cancelled")
+			span.End()
+		}
+		close(recvCh)
+	}()
+
+	return stream, nil
 }
 {{end}}
 `))
@@ -718,7 +645,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		// Extract trace context
 		ctx := extractTraceContext(context.Background(), msg.Header)
-		
+
 		// Start server span
 		ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
 			trace.SpanKindServer,
@@ -745,9 +672,18 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 			return
 		}
 
+		// Check if client wants to resume from a specific sequence
+		var startSeq uint64 = 0
+		if resumeSeq := msg.Header.Get("Resume-From-Seq"); resumeSeq != "" {
+			if seq, err := strconv.ParseUint(resumeSeq, 10, 64); err == nil {
+				startSeq = seq
+			}
+		}
+
 		stream := &{{streamImplType .ServiceName .Name "Server"}}{
-			nc:    nc,
-			reply: msg.Reply,
+			nc:     nc,
+			reply:  msg.Reply,
+			seqNum: startSeq,
 		}
 
 		if err := srv.{{.Name}}(req, stream); err != nil {
@@ -879,10 +815,10 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 	// Subscribe to init with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}.init", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
-		
+
 		// Extract trace context
 		ctx := extractTraceContext(context.Background(), msg.Header)
-		
+
 		// Start server span
 		ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
 			trace.SpanKindServer,
@@ -891,21 +827,41 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 			attribute.String("rpc.method", "{{.Name}}"),
 			attribute.String("stream.type", "bidirectional"),
 		)
-		
+
+		// Check if client wants to resume from a specific sequence
+		var startSeq uint64 = 0
+		if resumeSeq := msg.Header.Get("Resume-From-Seq"); resumeSeq != "" {
+			if seq, err := strconv.ParseUint(resumeSeq, 10, 64); err == nil {
+				startSeq = seq
+			}
+		}
+
+		// Check if stream already exists (reconnection scenario)
+		streamManager.mu.Lock()
+		existingStream := streamManager.streams[streamID]
+		if existingStream != nil {
+			// Update sequence number for resume
+			existingStream.mu.Lock()
+			existingStream.seqNum = startSeq
+			existingStream.mu.Unlock()
+			streamManager.mu.Unlock()
+			return
+		}
+
 		stream := &{{.ServiceName}}_{{.Name}}_ServerStream{
 			nc:          nc,
 			streamID:    streamID,
 			recvCh:      make(chan {{.InputType}}, 10),
 			sendSubject: streamID + ".out",
+			seqNum:      startSeq,
 		}
 
-		streamManager.mu.Lock()
 		streamManager.streams[streamID] = stream
 		streamManager.mu.Unlock()
 
 		go func() {
 			defer span.End()
-			
+
 			if err := srv.{{.Name}}(stream); err != nil {
 				if tracingEnabled {
 					span.RecordError(err)
@@ -980,9 +936,10 @@ type {{streamType .ServiceName .Name "Server"}} interface {
 }
 
 type {{streamImplType .ServiceName .Name "Server"}} struct {
-	nc    *nats.Conn
-	reply string
-	mu    sync.Mutex
+	nc     *nats.Conn
+	reply  string
+	seqNum uint64
+	mu     sync.Mutex
 }
 
 func (s *{{streamImplType .ServiceName .Name "Server"}}) Send(msg {{.OutputType}}) error {
@@ -994,7 +951,16 @@ func (s *{{streamImplType .ServiceName .Name "Server"}}) Send(msg {{.OutputType}
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	return s.nc.Publish(s.reply, data)
+	// Add sequence number to track message order
+	header := nats.Header{}
+	header.Set("Seq-Num", strconv.FormatUint(s.seqNum, 10))
+	s.seqNum++
+
+	return s.nc.PublishMsg(&nats.Msg{
+		Subject: s.reply,
+		Data:    data,
+		Header:  header,
+	})
 }
 
 func (s *{{streamImplType .ServiceName .Name "Server"}}) Close() error {
@@ -1017,14 +983,22 @@ type {{streamType .ServiceName .Name "Client"}} interface {
 }
 
 type {{streamImplType .ServiceName .Name "Client"}} struct {
-	nc     *nats.Conn
-	sub    *nats.Subscription
-	recvCh chan {{.OutputType}}
-	errCh  chan error
-	ctx    context.Context
-	span   trace.Span
-	mu     sync.Mutex
-	closed bool
+	nc               *nats.Conn
+	sub              *nats.Subscription
+	recvCh           chan {{.OutputType}}
+	errCh            chan error
+	ctx              context.Context
+	span             trace.Span
+	mu               sync.Mutex
+	closed           bool
+	lastSeqNum       uint64
+	reconnecting     bool
+	inbox            string
+	requestData      []byte
+	requestHeaders   nats.Header
+	topic            string
+	lastActivityNano int64 // atomic access only
+	stopMonitor      chan struct{}
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) Recv() ({{.OutputType}}, error) {
@@ -1050,12 +1024,160 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 	}
 
 	s.closed = true
-	
+
+	// Stop health monitor
+	if s.stopMonitor != nil {
+		close(s.stopMonitor)
+	}
+
 	if tracingEnabled && s.span.IsRecording() {
 		s.span.End()
 	}
-	
+
 	return s.sub.Unsubscribe()
+}
+
+func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
+	s.mu.Lock()
+	if s.closed || s.reconnecting {
+		s.mu.Unlock()
+		return nil
+	}
+	s.reconnecting = true
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.reconnecting = false
+		s.mu.Unlock()
+	}()
+
+	// Unsubscribe old subscription
+	if s.sub != nil {
+		s.sub.Unsubscribe()
+	}
+
+	// Create new subscription with same inbox
+	sub, err := s.nc.Subscribe(s.inbox, func(msg *nats.Msg) {
+		s.handleStreamMessage(msg)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to resubscribe: %w", err)
+	}
+	s.sub = sub
+
+	// Resend request with resume sequence number
+	resumeHeaders := nats.Header{}
+	for k, v := range s.requestHeaders {
+		resumeHeaders[k] = v
+	}
+	resumeHeaders.Set("Resume-From-Seq", strconv.FormatUint(s.lastSeqNum, 10))
+
+	if err := s.nc.PublishMsg(&nats.Msg{
+		Subject: s.topic,
+		Reply:   s.inbox,
+		Data:    s.requestData,
+		Header:  resumeHeaders,
+	}); err != nil {
+		return fmt.Errorf("failed to republish request: %w", err)
+	}
+
+	return nil
+}
+
+func (s *{{streamImplType .ServiceName .Name "Client"}}) startHealthMonitor() {
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-s.stopMonitor:
+				return
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				// Check if we've received any activity in the last 30 seconds
+				lastActivity := atomic.LoadInt64(&s.lastActivityNano)
+				if lastActivity > 0 {
+					elapsed := time.Since(time.Unix(0, lastActivity))
+					if elapsed > 3*time.Second {
+						// No activity for 30 seconds, attempt reconnection
+						if err := s.reconnect(); err != nil {
+							// If reconnection fails, report error
+							select {
+							case s.errCh <- fmt.Errorf("auto-reconnect failed: %w", err):
+							default:
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
+}
+
+func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg *nats.Msg) {
+	// Update activity timestamp atomically (lock-free)
+	atomic.StoreInt64(&s.lastActivityNano, time.Now().UnixNano())
+
+	// Check for EOF signal
+	if msg.Header.Get("Stream-EOF") == "true" {
+		if tracingEnabled {
+			s.span.SetAttributes(attribute.Int("stream.messages_received", int(s.lastSeqNum)))
+			s.span.SetStatus(codes.Ok, "")
+			s.span.End()
+		}
+		close(s.recvCh)
+		return
+	}
+
+	// Check for error
+	if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
+		err := fmt.Errorf("stream error: %s", errMsg)
+		if tracingEnabled {
+			s.span.RecordError(err)
+			s.span.SetStatus(codes.Error, errMsg)
+			s.span.End()
+		}
+		select {
+		case s.errCh <- err:
+		default:
+		}
+		close(s.recvCh)
+		return
+	}
+
+	out := &{{.OutputTypeName}}{}
+	if err := proto.Unmarshal(msg.Data, out); err != nil {
+		if tracingEnabled {
+			s.span.RecordError(err)
+		}
+		select {
+		case s.errCh <- fmt.Errorf("unmarshal error: %w", err):
+		default:
+		}
+		return
+	}
+
+	// Track sequence number (no lock needed for atomic read/write)
+	if seqStr := msg.Header.Get("Seq-Num"); seqStr != "" {
+		if seq, err := strconv.ParseUint(seqStr, 10, 64); err == nil {
+			s.mu.Lock()
+			s.lastSeqNum = seq + 1
+			s.mu.Unlock()
+		}
+	}
+
+	select {
+	case s.recvCh <- out:
+	case <-s.ctx.Done():
+		if tracingEnabled {
+			s.span.SetStatus(codes.Error, "context cancelled")
+			s.span.End()
+		}
+		return
+	}
 }
 `))
 
@@ -1229,17 +1351,21 @@ type {{streamType .ServiceName .Name "Client"}} interface {
 }
 
 type {{streamImplType .ServiceName .Name "Client"}} struct {
-	nc       *nats.Conn
-	streamID string
-	topic    string
-	recvCh   chan {{.OutputType}}
-	errCh    chan error
-	sub      *nats.Subscription
-	ctx      context.Context
-	span     trace.Span
-	seqNum   uint64
-	mu       sync.Mutex
-	closed   bool
+	nc               *nats.Conn
+	streamID         string
+	topic            string
+	recvCh           chan {{.OutputType}}
+	errCh            chan error
+	sub              *nats.Subscription
+	ctx              context.Context
+	span             trace.Span
+	seqNum           uint64
+	lastRecvSeq      uint64
+	mu               sync.Mutex
+	closed           bool
+	reconnecting     bool
+	lastActivityNano int64 // atomic access only
+	stopMonitor      chan struct{}
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) Send(msg {{.InputType}}) error {
@@ -1291,6 +1417,11 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 
 	s.closed = true
 
+	// Stop health monitor
+	if s.stopMonitor != nil {
+		close(s.stopMonitor)
+	}
+
 	header := nats.Header{}
 	header.Set("Stream-ID", s.streamID)
 
@@ -1309,6 +1440,143 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 	return nil
 }
 
+func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
+	s.mu.Lock()
+	if s.closed || s.reconnecting {
+		s.mu.Unlock()
+		return nil
+	}
+	s.reconnecting = true
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.reconnecting = false
+		s.mu.Unlock()
+	}()
+
+	// Resubscribe to output channel
+	if s.sub != nil {
+		s.sub.Unsubscribe()
+	}
+
+	sub, err := s.nc.Subscribe(s.streamID+".out", func(msg *nats.Msg) {
+		s.handleRecvMessage(msg)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to resubscribe: %w", err)
+	}
+	s.sub = sub
+
+	// Reinitialize stream with resume sequence
+	header := nats.Header{}
+	header.Set("Stream-ID", s.streamID)
+	header.Set("Resume-From-Seq", strconv.FormatUint(s.lastRecvSeq, 10))
+
+	if err := s.nc.PublishMsg(&nats.Msg{
+		Subject: s.topic + ".init",
+		Header:  header,
+	}); err != nil {
+		return fmt.Errorf("failed to reinitialize stream: %w", err)
+	}
+
+	return nil
+}
+
+func (s *{{streamImplType .ServiceName .Name "Client"}}) startHealthMonitor() {
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-s.stopMonitor:
+				return
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				// Check if we've received any activity in the last 30 seconds
+				lastActivity := atomic.LoadInt64(&s.lastActivityNano)
+				if lastActivity > 0 {
+					elapsed := time.Since(time.Unix(0, lastActivity))
+					if elapsed > 3*time.Second {
+						// No activity for 30 seconds, attempt reconnection
+						if err := s.reconnect(); err != nil {
+							// If reconnection fails, report error
+							select {
+							case s.errCh <- fmt.Errorf("auto-reconnect failed: %w", err):
+							default:
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
+}
+
+func (s *{{streamImplType .ServiceName .Name "Client"}}) handleRecvMessage(msg *nats.Msg) {
+	// Update activity timestamp atomically (lock-free)
+	atomic.StoreInt64(&s.lastActivityNano, time.Now().UnixNano())
+
+	// Check for EOF
+	if msg.Header.Get("Stream-EOF") == "true" {
+		if tracingEnabled {
+			s.span.SetStatus(codes.Ok, "")
+			s.span.End()
+		}
+		close(s.recvCh)
+		return
+	}
+
+	// Check for error
+	if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
+		err := fmt.Errorf("stream error: %s", errMsg)
+		if tracingEnabled {
+			s.span.RecordError(err)
+			s.span.SetStatus(codes.Error, errMsg)
+			s.span.End()
+		}
+		select {
+		case s.errCh <- err:
+		default:
+		}
+		close(s.recvCh)
+		return
+	}
+
+	out := &{{.OutputTypeName}}{}
+	if err := proto.Unmarshal(msg.Data, out); err != nil {
+		if tracingEnabled {
+			s.span.RecordError(err)
+		}
+		select {
+		case s.errCh <- fmt.Errorf("unmarshal error: %w", err):
+		default:
+		}
+		return
+	}
+
+	// Track sequence number
+	if seqStr := msg.Header.Get("Seq-Num"); seqStr != "" {
+		if seq, err := strconv.ParseUint(seqStr, 10, 64); err == nil {
+			s.mu.Lock()
+			s.lastRecvSeq = seq + 1
+			s.mu.Unlock()
+		}
+	}
+
+	select {
+	case s.recvCh <- out:
+	case <-s.ctx.Done():
+		if tracingEnabled {
+			s.span.SetStatus(codes.Error, "context cancelled")
+			s.span.End()
+		}
+		return
+	}
+}
+
 // Server-side interface for bidirectional streaming
 type {{streamType .ServiceName .Name "Server"}} interface {
 	Send({{.OutputType}}) error
@@ -1320,6 +1588,7 @@ type {{streamImplType .ServiceName .Name "Server"}} struct {
 	streamID    string
 	recvCh      chan {{.InputType}}
 	sendSubject string
+	seqNum      uint64
 	mu          sync.Mutex
 	closed      bool
 }
@@ -1337,7 +1606,16 @@ func (s *{{streamImplType .ServiceName .Name "Server"}}) Send(msg {{.OutputType}
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	return s.nc.Publish(s.sendSubject, data)
+	// Add sequence number for tracking
+	header := nats.Header{}
+	header.Set("Seq-Num", strconv.FormatUint(s.seqNum, 10))
+	s.seqNum++
+
+	return s.nc.PublishMsg(&nats.Msg{
+		Subject: s.sendSubject,
+		Data:    data,
+		Header:  header,
+	})
 }
 
 func (s *{{streamImplType .ServiceName .Name "Server"}}) Recv() ({{.InputType}}, error) {

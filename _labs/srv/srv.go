@@ -67,7 +67,7 @@ func (c CustomAccountsService) ListAccounts(ctx context.Context, request *accoun
 }
 
 func (c CustomAccountsService) StreamWalletUpdates(server accounts.AccountService_StreamWalletUpdatesServer) error {
-	list := FakeWallets(10)
+	list := FakeWallets(2000)
 	for _, w := range list {
 		if err := server.Send(w); err != nil {
 			return err
@@ -122,7 +122,6 @@ func FakeWallets(n int) []*accounts.Wallet {
 			w.Currency = currency
 			w.Status = status
 		}))
-		time.Sleep(time.Microsecond)
 	}
 	return res
 }
