@@ -10,10 +10,9 @@ const playgroundHTML = `<!DOCTYPE html>
     <link rel="stylesheet" href="https://unpkg.com/primevue@3.52.0/resources/themes/viva-dark/theme.css">
     <link rel="stylesheet" href="https://unpkg.com/primevue@3.52.0/resources/primevue.min.css">
     <link rel="stylesheet" href="https://unpkg.com/primeicons@6.0.1/primeicons.css">
-    <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
-    <script src="https://unpkg.com/primevue@3.52.0/core/core.min.js"></script>
-    <script src="https://unpkg.com/primevue@3.52.0/datatable/datatable.min.js"></script>
-    <script src="https://unpkg.com/primevue@3.52.0/column/column.min.js"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/primevue/umd/primevue.min.js"></script>
+    <script src="https://unpkg.com/@primevue/themes/umd/aura.min.js"></script>
     <script>
         tailwind.config = {
             darkMode: 'class',
@@ -38,7 +37,7 @@ const playgroundHTML = `<!DOCTYPE html>
                 </div>
                 
                 <div class="flex-1 overflow-y-auto p-2.5">
-                    <DataTable 
+                    <p-datatable 
                         :value="methods" 
                         selection-mode="single"
                         v-model:selection="selectedMethod"
@@ -62,7 +61,7 @@ const playgroundHTML = `<!DOCTYPE html>
                                 </div>
                             </template>
                         </Column>
-                    </DataTable>
+                    </p-datatable>
                 </div>
             </div>
 
@@ -129,7 +128,8 @@ const playgroundHTML = `<!DOCTYPE html>
                                 <div v-for="(msg, idx) in streamMessages" :key="idx" 
                                      :class="['bg-gray-800 border-l-2 p-3 mb-2.5 rounded font-mono text-xs', msg.error ? 'border-red-500' : 'border-blue-500']">
                                     <div class="flex justify-between mb-2 text-gray-500 text-[11px]">
-                                        <span>[[ msg.error ? 'Error' : ` + `Message #${idx + 1}` + ` ]]</span>
+                                        <span v-if="msg.error">Error</span>
+										<span v-else v-text="'Message #' + (idx + 1)"></span>
                                         <span>[[ msg.timestamp ]]ms</span>
                                     </div>
                                     <pre class="whitespace-pre-wrap">[[ msg.data ]]</pre>
@@ -161,173 +161,203 @@ const playgroundHTML = `<!DOCTYPE html>
         </div>
     </div>
 
-    <script>
-        const { createApp } = Vue;
+<script>
+const { createApp, ref, onMounted, computed } = Vue;
 
-        createApp({
-			delimiters: ['[[', ']]'],
-            data() {
-                return {
-                    methods: [],
-                    selectedMethod: null,
-                    requestBody: '{}',
-                    timeout: 30,
-                    response: null,
-                    isExecuting: false,
-                    isStreaming: false,
-                    streamMessages: [],
-                    streamStartTime: null
-                }
-            },
-            mounted() {
-                this.loadMethods();
-            },
-            methods: {
-                async loadMethods() {
-                    try {
-                        const res = await fetch('/api/methods');
-                        const data = await res.json();
-                        this.methods = data.methods;
-                    } catch (error) {
-                        console.error('Failed to load methods:', error);
-                    }
-                },
-                onMethodSelect(event) {
-                    this.requestBody = '{}';
-                    this.response = null;
-                    this.streamMessages = [];
-                    this.isStreaming = false;
-                },
-                getStreamTypeClass(type) {
-                    const map = {
-                        'UNARY': 'bg-green-700 text-white',
-                        'SERVER_STREAMING': 'bg-yellow-700 text-white',
-                        'CLIENT_STREAMING': 'bg-purple-700 text-white',
-                        'BIDI_STREAMING': 'bg-red-700 text-white'
-                    };
-                    return map[type] || 'bg-gray-700 text-white';
-                },
-                formatStreamType(type) {
-                    return type.replace(/_/g, ' ');
-                },
-                async executeMethod() {
-                    if (!this.selectedMethod) return;
+createApp({
+    delimiters: ['[[', ']]'],
+    setup() {
+        // Reactive state
+        const methods = ref([]);
+        const selectedMethod = ref(null);
+        const requestBody = ref('{}');
+        const timeout = ref(30);
+        const response = ref(null);
+        const isExecuting = ref(false);
+        const isStreaming = ref(false);
+        const streamMessages = ref([]);
+        const streamStartTime = ref(null);
 
-                    this.isExecuting = true;
-                    this.response = null;
-                    this.streamMessages = [];
+        // Methods
+        const loadMethods = async () => {
+            try {
+                const res = await fetch('/api/methods');
+                const data = await res.json();
+                methods.value = data.methods;
+            } catch (error) {
+                console.error('Failed to load methods:', error);
+            }
+        };
 
-                    try {
-                        const payload = JSON.parse(this.requestBody);
+        const onMethodSelect = (event) => {
+            requestBody.value = '{}';
+            response.value = null;
+            streamMessages.value = [];
+            isStreaming.value = false;
+        };
 
-                        if (this.selectedMethod.streamType === 'SERVER_STREAMING') {
-                            await this.executeServerStream(payload);
-                        } else if (this.selectedMethod.streamType === 'UNARY') {
-                            await this.executeUnary(payload);
-                        } else {
-                            throw new Error(` + `${this.selectedMethod.streamType} not yet supported` + `);
-                        }
-                    } catch (error) {
-                        this.response = { error: true, data: error.message, duration: 0 };
-                    } finally {
-                        this.isExecuting = false;
-                    }
-                },
-                async executeUnary(payload) {
-                    const startTime = Date.now();
-                    const res = await fetch('/api/invoke', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            method: this.selectedMethod.name,
-                            payload: payload,
-                            headers: {},
-                            timeout: this.timeout
-                        })
-                    });
+        const getStreamTypeClass = (type) => {
+            const map = {
+                'UNARY': 'bg-green-700 text-white',
+                'SERVER_STREAMING': 'bg-yellow-700 text-white',
+                'CLIENT_STREAMING': 'bg-purple-700 text-white',
+                'BIDI_STREAMING': 'bg-red-700 text-white'
+            };
+            return map[type] || 'bg-gray-700 text-white';
+        };
 
-                    const result = await res.json();
-                    const duration = result.durationMs || (Date.now() - startTime);
+        const formatStreamType = (type) => {
+            return type.replace(/_/g, ' ');
+        };
 
-                    if (result.success) {
-                        this.response = {
-                            error: false,
-                            data: JSON.stringify(result.response, null, 2),
-                            duration
-                        };
-                    } else {
-                        this.response = {
-                            error: true,
-                            data: result.error,
-                            duration
-                        };
-                    }
-                },
-                async executeServerStream(payload) {
-                    this.isStreaming = true;
-                    this.streamStartTime = Date.now();
+        const executeUnary = async (payload) => {
+            const startTime = Date.now();
+            const res = await fetch('/api/invoke', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    method: selectedMethod.value.name,
+                    payload: payload,
+                    headers: {},
+                    timeout: timeout.value
+                })
+            });
 
-                    const res = await fetch('/api/stream', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            method: this.selectedMethod.name,
-                            payload: payload,
-                            headers: {},
-                            timeout: this.timeout
-                        })
-                    });
+            const result = await res.json();
+            const duration = result.durationMs || (Date.now() - startTime);
 
-                    const reader = res.body.getReader();
-                    const decoder = new TextDecoder();
+            if (result.success) {
+                response.value = {
+                    error: false,
+                    data: JSON.stringify(result.response, null, 2),
+                    duration
+                };
+            } else {
+                response.value = {
+                    error: true,
+                    data: result.error,
+                    duration
+                };
+            }
+        };
 
-                    while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
+        const executeServerStream = async (payload) => {
+            isStreaming.value = true;
+            streamStartTime.value = Date.now();
 
-                        const chunk = decoder.decode(value);
-                        const lines = chunk.split('\n\n');
+            const res = await fetch('/api/stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    method: selectedMethod.value.name,
+                    payload: payload,
+                    headers: {},
+                    timeout: timeout.value
+                })
+            });
 
-                        for (const line of lines) {
-                            if (!line.trim()) continue;
-                            const eventMatch = line.match(/^event: (.+)$/m);
-                            const dataMatch = line.match(/^data: (.+)$/m);
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
 
-                            if (eventMatch && dataMatch) {
-                                const event = eventMatch[1];
-                                const data = dataMatch[1];
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
 
-                                if (event === 'message') {
-                                    this.streamMessages.push({
-                                        data: JSON.stringify(JSON.parse(data), null, 2),
-                                        timestamp: Date.now() - this.streamStartTime,
-                                        error: false
-                                    });
-                                } else if (event === 'error') {
-                                    this.streamMessages.push({
-                                        data: data,
-                                        timestamp: Date.now() - this.streamStartTime,
-                                        error: true
-                                    });
-                                } else if (event === 'close') {
-                                    this.response = {
-                                        error: false,
-                                        data: '',
-                                        duration: Date.now() - this.streamStartTime
-                                    };
-                                }
-                            }
+                const chunk = decoder.decode(value);
+                const lines = chunk.split('\n\n');
+
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    const eventMatch = line.match(/^event: (.+)$/m);
+                    const dataMatch = line.match(/^data: (.+)$/m);
+
+                    if (eventMatch && dataMatch) {
+                        const event = eventMatch[1];
+                        const data = dataMatch[1];
+
+                        if (event === 'message') {
+                            streamMessages.value.push({
+                                data: JSON.stringify(JSON.parse(data), null, 2),
+                                timestamp: Date.now() - streamStartTime.value,
+                                error: false
+                            });
+                        } else if (event === 'error') {
+                            streamMessages.value.push({
+                                data: data,
+                                timestamp: Date.now() - streamStartTime.value,
+                                error: true
+                            });
+                        } else if (event === 'close') {
+                            response.value = {
+                                error: false,
+                                data: '',
+                                duration: Date.now() - streamStartTime.value
+                            };
                         }
                     }
-
-                    this.isStreaming = false;
                 }
             }
-        })
-        .use(primevue.config.default)
-        .component('DataTable', primevue.datatable)
-        .component('Column', primevue.column)
-        .mount('#app');
-    </script>
+
+            isStreaming.value = false;
+        };
+
+        const executeMethod = async () => {
+            if (!selectedMethod.value) return;
+
+            isExecuting.value = true;
+            response.value = null;
+            streamMessages.value = [];
+
+            try {
+                const payload = JSON.parse(requestBody.value);
+
+                if (selectedMethod.value.streamType === 'SERVER_STREAMING') {
+                    await executeServerStream(payload);
+                } else if (selectedMethod.value.streamType === 'UNARY') {
+                    await executeUnary(payload);
+                } else {
+                    const msg = selectedMethod.value.streamType + " not yet supported";
+                    throw new Error(msg);
+                }
+            } catch (error) {
+                response.value = { error: true, data: error.message, duration: 0 };
+            } finally {
+                isExecuting.value = false;
+            }
+        };
+
+        // Lifecycle
+        onMounted(() => {
+            loadMethods();
+        });
+
+        // Return everything that needs to be available in the template
+        return {
+            methods,
+            selectedMethod,
+            requestBody,
+            timeout,
+            response,
+            isExecuting,
+            isStreaming,
+            streamMessages,
+            streamStartTime,
+            loadMethods,
+            onMethodSelect,
+            getStreamTypeClass,
+            formatStreamType,
+            executeMethod
+        };
+    }
+})
+.use(PrimeVue.Config, {
+    theme: {
+        preset: PrimeVue.Themes.Aura
+    }
+})
+.component('p-datatable', PrimeVue.DataTable)
+.component('Column', PrimeVue.Column)
+.mount('#app');
+</script>
 </body>
 </html>`

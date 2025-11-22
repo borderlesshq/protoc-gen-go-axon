@@ -40,13 +40,150 @@ func New{{.Name}}Client(nc *nats.Conn) {{.Name}}Client {
 
 // Server registration template
 var _ = template.Must(FileTemplate.New("serverRegistration").Parse(`
-// Register{{.Name}}Server registers the service implementation with NATS.
-func Register{{.Name}}Server(nc *nats.Conn, srv {{.Name}}Server) error {
+// Service descriptor for {{.Name}}
+var {{.Name}}_ServiceDesc = ServiceDesc{
+	ServiceName: "{{.Name}}",
+	HandlerType: (*{{.Name}}Server)(nil),
+	Methods: []MethodDesc{
 {{range .Methods}}
-	{{template "serverMethodRegistration" .}}
+{{if isUnary .}}
+		{
+			MethodName: "{{.Name}}",
+			Handler:    _{{.ServiceName}}_{{.Name}}_Handler,
+		},
 {{end}}
-	return nil
+{{end}}
+	},
+	Streams: []StreamDesc{
+{{range .Methods}}
+{{if not (isUnary .)}}
+		{
+			StreamName:    "{{.Name}}",
+			Handler:       _{{.ServiceName}}_{{.Name}}_Handler,
+			ServerStreams: {{.IsServerStreaming}},
+			ClientStreams: {{.IsClientStreaming}},
+		},
+{{end}}
+{{end}}
+	},
 }
+
+// Register{{.Name}}Server registers the service with optional interceptors
+func Register{{.Name}}Server(nc *nats.Conn, srv {{.Name}}Server, opts ...ServerOption) (*Server, error) {
+	s := NewServer(nc, opts...)
+	if err := s.registerService(&{{.Name}}_ServiceDesc, srv); err != nil {
+		return nil, err
+	}
+	
+	return s, nil
+}
+
+// Register{{.Name}}ServerWithServer registers with an existing server
+func Register{{.Name}}ServerWithServer(s *Server, srv {{.Name}}Server) (*Server, error) {
+	if err := s.registerService(&{{.Name}}_ServiceDesc, srv); err != nil {
+		return nil, err
+	}
+	
+	return s, nil
+}
+
+{{range .Methods}}
+{{if isUnary .}}
+// Handler wrapper for {{.Name}}
+func _{{.ServiceName}}_{{.Name}}_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor UnaryServerInterceptor) (interface{}, error) {
+	in := &{{.InputTypeName}}{}
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	
+	if interceptor == nil {
+		return srv.({{.ServiceName}}Server).{{.Name}}(ctx, in)
+	}
+	
+	info := &UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "{{.ServiceName}}.{{.Name}}",
+	}
+	
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.({{.ServiceName}}Server).{{.Name}}(ctx, req.({{.InputType}}))
+	}
+	
+	return interceptor(ctx, in, info, handler)
+}
+{{else}}
+// Handler wrapper for streaming {{.Name}}
+func _{{.ServiceName}}_{{.Name}}_Handler(srv interface{}, stream ServerStream, interceptor StreamServerInterceptor) error {
+	if interceptor == nil {
+		{{if isServerStreaming .}}
+		// Server streaming: need to decode initial request from stream context
+		req := stream.(*wrappedServerStream_{{.ServiceName}}_{{.Name}}).req
+		return srv.({{.ServiceName}}Server).{{.Name}}(req, stream.(*wrappedServerStream_{{.ServiceName}}_{{.Name}}).{{streamType .ServiceName .Name "Server"}})
+		{{else if isClientStreaming .}}
+		// Client streaming: wrap stream for Recv operations
+		return srv.({{.ServiceName}}Server).{{.Name}}(stream.(*wrappedServerStream_{{.ServiceName}}_{{.Name}}).{{streamType .ServiceName .Name "Server"}})
+		{{else}}
+		// Bidirectional streaming
+		return srv.({{.ServiceName}}Server).{{.Name}}(stream.(*wrappedServerStream_{{.ServiceName}}_{{.Name}}).{{streamType .ServiceName .Name "Server"}})
+		{{end}}
+	}
+
+	info := &StreamServerInfo{
+		Server:         srv,
+		FullMethod:     "{{.ServiceName}}.{{.Name}}",
+		IsClientStream: {{.IsClientStreaming}},
+		IsServerStream: {{.IsServerStreaming}},
+	}
+
+	handler := func(srv interface{}, ss ServerStream) error {
+		{{if isServerStreaming .}}
+		req := ss.(*wrappedServerStream_{{.ServiceName}}_{{.Name}}).req
+		return srv.({{.ServiceName}}Server).{{.Name}}(req, ss.(*wrappedServerStream_{{.ServiceName}}_{{.Name}}).{{streamType .ServiceName .Name "Server"}})
+		{{else if isClientStreaming .}}
+		return srv.({{.ServiceName}}Server).{{.Name}}(ss.(*wrappedServerStream_{{.ServiceName}}_{{.Name}}).{{streamType .ServiceName .Name "Server"}})
+		{{else}}
+		return srv.({{.ServiceName}}Server).{{.Name}}(ss.(*wrappedServerStream_{{.ServiceName}}_{{.Name}}).{{streamType .ServiceName .Name "Server"}})
+		{{end}}
+	}
+
+	return interceptor(srv, stream, info, handler)
+}
+
+// wrappedServerStream for {{.Name}}
+type wrappedServerStream_{{.ServiceName}}_{{.Name}} struct {
+	{{streamType .ServiceName .Name "Server"}}
+	ctx context.Context
+	{{if isServerStreaming .}}
+	req {{.InputType}}
+	{{end}}
+}
+
+func (w *wrappedServerStream_{{.ServiceName}}_{{.Name}}) Context() context.Context {
+	return w.ctx
+}
+
+func (w *wrappedServerStream_{{.ServiceName}}_{{.Name}}) SendMsg(m interface{}) error {
+	{{if or (isServerStreaming .) (isBidirectional .)}}
+	return w.{{streamType .ServiceName .Name "Server"}}.Send(m.({{.OutputType}}))
+	{{else}}
+	return w.{{streamType .ServiceName .Name "Server"}}.SendAndClose(m.({{.OutputType}}))
+	{{end}}
+}
+
+func (w *wrappedServerStream_{{.ServiceName}}_{{.Name}}) RecvMsg(m interface{}) error {
+	{{if or (isClientStreaming .) (isBidirectional .)}}
+	msg, err := w.{{streamType .ServiceName .Name "Server"}}.Recv()
+	if err != nil {
+		return err
+	}
+	*(m.({{.InputType}})) = *msg
+	return nil
+	{{else}}
+	return io.EOF // Server streaming doesn't receive from client
+	{{end}}
+}
+{{end}}
+{{end}}
 `))
 
 // Streaming interfaces template

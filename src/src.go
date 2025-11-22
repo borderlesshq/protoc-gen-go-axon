@@ -74,6 +74,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,9 +83,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/reflect/protoreflect"
-	"google.golang.org/protobuf/types/dynamicpb"
-	
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -182,6 +181,10 @@ func WithHeader(key, value string) CallOption {
 	}
 }
 
+
+
+{{template "serverInterceptors" .}}
+
 {{range .Services}}
 {{template "serverInterface" .}}
 {{template "clientInterface" .}}
@@ -191,3 +194,5 @@ func WithHeader(key, value string) CallOption {
 {{template "playgroundSupport" .}}
 {{end}}
 `))
+
+//#{{template "serverRegistration" .}}

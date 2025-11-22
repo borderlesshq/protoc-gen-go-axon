@@ -14,8 +14,8 @@ var _ = template.Must(FileTemplate.New("playgroundSupport").Parse(`
 // Playground Support for {{.Name}}
 // ===============================================
 
-// {{.Name}}Playground provides a web interface for testing {{.Name}} methods
-type {{.Name}}Playground struct {
+// servicePlayground provides a web interface for testing {{.Name}} methods
+type servicePlayground struct {
 	nc     *nats.Conn
 	server *http.Server
 	mu     sync.Mutex
@@ -28,8 +28,8 @@ type {{.Name}}Playground struct {
 //   defer playground.Shutdown(context.Background())
 // 
 // Then open http://localhost:8080 in your browser
-func EnablePlayground(nc *nats.Conn, addr string) *{{.Name}}Playground {
-	pg := &{{.Name}}Playground{
+func enablePlayground(nc *nats.Conn, addr string) *servicePlayground {
+	pg := &servicePlayground{
 		nc: nc,
 	}
 	
@@ -44,17 +44,11 @@ func EnablePlayground(nc *nats.Conn, addr string) *{{.Name}}Playground {
 		Handler: mux,
 	}
 	
-	go func() {
-		if err := pg.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			// Server closed
-		}
-	}()
-	
 	return pg
 }
 
 // Shutdown gracefully shuts down the playground server
-func (pg *{{.Name}}Playground) Shutdown(ctx context.Context) error {
+func (pg *servicePlayground) Shutdown(ctx context.Context) error {
 	pg.mu.Lock()
 	defer pg.mu.Unlock()
 	
@@ -65,7 +59,7 @@ func (pg *{{.Name}}Playground) Shutdown(ctx context.Context) error {
 }
 
 // handleUI serves the playground HTML interface
-func (pg *{{.Name}}Playground) handleUI(w http.ResponseWriter, r *http.Request) {
+func (pg *servicePlayground) handleUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(playgroundHTML))
 }
@@ -80,7 +74,7 @@ type {{.Name}}MethodInfo struct {
 }
 
 // handleListMethods returns all methods for this service
-func (pg *{{.Name}}Playground) handleListMethods(w http.ResponseWriter, r *http.Request) {
+func (pg *servicePlayground) handleListMethods(w http.ResponseWriter, r *http.Request) {
 	methods := []{{.Name}}MethodInfo{
 {{range .Methods}}
 		{
@@ -116,7 +110,7 @@ type {{.Name}}InvokeResponse struct {
 }
 
 // handleInvoke handles unary RPC invocations from the playground
-func (pg *{{.Name}}Playground) handleInvoke(w http.ResponseWriter, r *http.Request) {
+func (pg *servicePlayground) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -144,7 +138,7 @@ func (pg *{{.Name}}Playground) handleInvoke(w http.ResponseWriter, r *http.Reque
 {{range .Methods}}
 {{if isUnary .}}
 // handle{{.Name}}Invoke executes the {{.Name}} method
-func (pg *{{.ServiceName}}Playground) handle{{.Name}}Invoke(w http.ResponseWriter, req *{{.ServiceName}}InvokeRequest) {
+func (pg *servicePlayground) handle{{.Name}}Invoke(w http.ResponseWriter, req *{{.ServiceName}}InvokeRequest) {
 	// Create input message
 	inputMsg := &{{.InputTypeName}}{}
 	if err := protojson.Unmarshal(req.Payload, inputMsg); err != nil {
@@ -244,7 +238,7 @@ func (pg *{{.ServiceName}}Playground) handle{{.Name}}Invoke(w http.ResponseWrite
 {{end}}
 
 // handleStream handles streaming RPCs
-func (pg *{{.ServiceName}}Playground) handleStream(w http.ResponseWriter, r *http.Request) {
+func (pg *servicePlayground) handleStream(w http.ResponseWriter, r *http.Request) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -278,7 +272,7 @@ func (pg *{{.ServiceName}}Playground) handleStream(w http.ResponseWriter, r *htt
 {{range .Methods}}
 {{if isServerStreaming .}}
 // handle{{.Name}}Stream handles server streaming for {{.Name}}
-func (pg *{{.ServiceName}}Playground) handle{{.Name}}Stream(w http.ResponseWriter, r *http.Request, flusher http.Flusher, req *{{.ServiceName}}InvokeRequest) {
+func (pg *servicePlayground) handle{{.Name}}Stream(w http.ResponseWriter, r *http.Request, flusher http.Flusher, req *{{.ServiceName}}InvokeRequest) {
 	// Create input message
 	inputMsg := &{{.InputTypeName}}{}
 	if err := protojson.Unmarshal(req.Payload, inputMsg); err != nil {
