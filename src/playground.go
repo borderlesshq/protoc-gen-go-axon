@@ -405,6 +405,32 @@ func headerToMap(h nats.Header) map[string]string {
 	return m
 }
 
+{{if hasClientOrBidiStreaming .Methods}}
+// Shared Streaming Types (used by both client and bidirectional streaming)
+
+type {{.Name}}StreamSendRequest struct {
+	StreamID string          ` + "`" + `json:"streamId"` + "`" + `
+	Method   string          ` + "`" + `json:"method"` + "`" + `
+	Payload  json.RawMessage ` + "`" + `json:"payload"` + "`" + `
+}
+
+type {{.Name}}StreamSendResponse struct {
+	Success bool   ` + "`" + `json:"success"` + "`" + `
+	Error   string ` + "`" + `json:"error,omitempty"` + "`" + `
+}
+
+type {{.Name}}StreamCloseRequest struct {
+	StreamID string ` + "`" + `json:"streamId"` + "`" + `
+	Method   string ` + "`" + `json:"method"` + "`" + `
+}
+
+type {{.Name}}StreamCloseResponse struct {
+	Success  bool            ` + "`" + `json:"success"` + "`" + `
+	Response json.RawMessage ` + "`" + `json:"response,omitempty"` + "`" + `
+	Error    string          ` + "`" + `json:"error,omitempty"` + "`" + `
+}
+{{end}}
+
 {{if hasClientStreaming .Methods}}
 // Client Streaming Handlers
 
@@ -458,17 +484,6 @@ func (pg *servicePlayground) handleClientStreamInit(w http.ResponseWriter, r *ht
 	})
 }
 
-type {{.Name}}StreamSendRequest struct {
-	StreamID string          ` + "`" + `json:"streamId"` + "`" + `
-	Method   string          ` + "`" + `json:"method"` + "`" + `
-	Payload  json.RawMessage ` + "`" + `json:"payload"` + "`" + `
-}
-
-type {{.Name}}StreamSendResponse struct {
-	Success bool   ` + "`" + `json:"success"` + "`" + `
-	Error   string ` + "`" + `json:"error,omitempty"` + "`" + `
-}
-
 func (pg *servicePlayground) handleClientStreamSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -501,17 +516,6 @@ func (pg *servicePlayground) handleClientStreamSend(w http.ResponseWriter, r *ht
 	json.NewEncoder(w).Encode(&{{.Name}}StreamSendResponse{
 		Success: true,
 	})
-}
-
-type {{.Name}}StreamCloseRequest struct {
-	StreamID string ` + "`" + `json:"streamId"` + "`" + `
-	Method   string ` + "`" + `json:"method"` + "`" + `
-}
-
-type {{.Name}}StreamCloseResponse struct {
-	Success  bool            ` + "`" + `json:"success"` + "`" + `
-	Response json.RawMessage ` + "`" + `json:"response,omitempty"` + "`" + `
-	Error    string          ` + "`" + `json:"error,omitempty"` + "`" + `
 }
 
 func (pg *servicePlayground) handleClientStreamClose(w http.ResponseWriter, r *http.Request) {

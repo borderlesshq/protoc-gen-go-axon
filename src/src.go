@@ -83,6 +83,15 @@ var templateFuncs = template.FuncMap{
 		}
 		return false
 	},
+	// Helper to check if service has client streaming OR bidirectional (for shared types)
+	"hasClientOrBidiStreaming": func(methods []*MethodData) bool {
+		for _, m := range methods {
+			if m.IsClientStreaming {
+				return true
+			}
+		}
+		return false
+	},
 }
 
 // Main template for the entire file
