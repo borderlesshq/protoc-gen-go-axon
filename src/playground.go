@@ -14,11 +14,25 @@ var _ = template.Must(FileTemplate.New("playgroundSupport").Parse(`
 // Playground Support for {{.Name}}
 // ===============================================
 
+// streamSession represents an active streaming session
+type streamSession struct {
+	streamID    string
+	method      string
+	inbox       string
+	messages    []json.RawMessage
+	responseCh  chan json.RawMessage
+	errorCh     chan string
+	closeCh     chan struct{}
+	sub         *nats.Subscription
+	createdAt   time.Time
+}
+
 // servicePlayground provides a web interface for testing {{.Name}} methods
 type servicePlayground struct {
-	nc     *nats.Conn
-	server *http.Server
-	mu     sync.Mutex
+	nc            *nats.Conn
+	server        *http.Server
+	mu            sync.Mutex
+	streamSessions map[string]*streamSession
 }
 
 // EnablePlayground starts an HTTP server with a web UI for testing this service
@@ -30,7 +44,8 @@ type servicePlayground struct {
 // Then open http://localhost:8080 in your browser
 func enablePlayground(nc *nats.Conn, addr string) *servicePlayground {
 	pg := &servicePlayground{
-		nc: nc,
+		nc:            nc,
+		streamSessions: make(map[string]*streamSession),
 	}
 	
 	mux := http.NewServeMux()
@@ -38,6 +53,12 @@ func enablePlayground(nc *nats.Conn, addr string) *servicePlayground {
 	mux.HandleFunc("/api/methods", pg.handleListMethods)
 	mux.HandleFunc("/api/invoke", pg.handleInvoke)
 	mux.HandleFunc("/api/stream", pg.handleStream)
+	mux.HandleFunc("/api/client-stream/init", pg.handleClientStreamInit)
+	mux.HandleFunc("/api/client-stream/send", pg.handleClientStreamSend)
+	mux.HandleFunc("/api/client-stream/close", pg.handleClientStreamClose)
+	mux.HandleFunc("/api/bidi-stream", pg.handleBidiStream)
+	mux.HandleFunc("/api/bidi-stream/send", pg.handleBidiStreamSend)
+	mux.HandleFunc("/api/bidi-stream/close", pg.handleBidiStreamClose)
 	
 	pg.server = &http.Server{
 		Addr:    addr,
@@ -375,6 +396,578 @@ func headerToMap(h nats.Header) map[string]string {
 	}
 	return m
 }
+
+// Client Streaming Handlers
+
+type {{.Name}}ClientStreamInitRequest struct {
+	Method  string            ` + "`" + `json:"method"` + "`" + `
+	Headers map[string]string ` + "`" + `json:"headers"` + "`" + `
+	Timeout int               ` + "`" + `json:"timeout"` + "`" + `
+}
+
+type {{.Name}}ClientStreamInitResponse struct {
+	Success  bool   ` + "`" + `json:"success"` + "`" + `
+	StreamID string ` + "`" + `json:"streamId,omitempty"` + "`" + `
+	Error    string ` + "`" + `json:"error,omitempty"` + "`" + `
+}
+
+func (pg *servicePlayground) handleClientStreamInit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req {{.Name}}ClientStreamInitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// Generate stream ID
+	streamID := nats.NewInbox()
+
+	// Create session
+	session := &streamSession{
+		streamID:   streamID,
+		method:     req.Method,
+		inbox:      nats.NewInbox(),
+		messages:   make([]json.RawMessage, 0),
+		responseCh: make(chan json.RawMessage, 10),
+		errorCh:    make(chan string, 1),
+		closeCh:    make(chan struct{}),
+		createdAt:  time.Now(),
+	}
+
+	pg.mu.Lock()
+	pg.streamSessions[streamID] = session
+	pg.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.Name}}ClientStreamInitResponse{
+		Success:  true,
+		StreamID: streamID,
+	})
+}
+
+type {{.Name}}StreamSendRequest struct {
+	StreamID string          ` + "`" + `json:"streamId"` + "`" + `
+	Method   string          ` + "`" + `json:"method"` + "`" + `
+	Payload  json.RawMessage ` + "`" + `json:"payload"` + "`" + `
+}
+
+type {{.Name}}StreamSendResponse struct {
+	Success bool   ` + "`" + `json:"success"` + "`" + `
+	Error   string ` + "`" + `json:"error,omitempty"` + "`" + `
+}
+
+func (pg *servicePlayground) handleClientStreamSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req {{.Name}}StreamSendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	pg.mu.Lock()
+	session, exists := pg.streamSessions[req.StreamID]
+	pg.mu.Unlock()
+
+	if !exists {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&{{.Name}}StreamSendResponse{
+			Success: false,
+			Error:   "Stream not found",
+		})
+		return
+	}
+
+	// Store message
+	session.messages = append(session.messages, req.Payload)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.Name}}StreamSendResponse{
+		Success: true,
+	})
+}
+
+type {{.Name}}StreamCloseRequest struct {
+	StreamID string ` + "`" + `json:"streamId"` + "`" + `
+	Method   string ` + "`" + `json:"method"` + "`" + `
+}
+
+type {{.Name}}StreamCloseResponse struct {
+	Success  bool            ` + "`" + `json:"success"` + "`" + `
+	Response json.RawMessage ` + "`" + `json:"response,omitempty"` + "`" + `
+	Error    string          ` + "`" + `json:"error,omitempty"` + "`" + `
+}
+
+func (pg *servicePlayground) handleClientStreamClose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req {{.Name}}StreamCloseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	pg.mu.Lock()
+	session, exists := pg.streamSessions[req.StreamID]
+	if exists {
+		delete(pg.streamSessions, req.StreamID)
+	}
+	pg.mu.Unlock()
+
+	if !exists {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&{{.Name}}StreamCloseResponse{
+			Success: false,
+			Error:   "Stream not found",
+		})
+		return
+	}
+
+	// Route to appropriate handler
+	switch req.Method {
+{{range .Methods}}
+{{if isClientStreaming .}}
+	case "{{.Name}}":
+		pg.handle{{.Name}}ClientStreamClose(w, session)
+		return
+{{end}}
+{{end}}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.Name}}StreamCloseResponse{
+		Success: false,
+		Error:   "Method not found or not client streaming",
+	})
+}
+
+{{range .Methods}}
+{{if isClientStreaming .}}
+// handle{{.Name}}ClientStreamClose handles closing a client stream for {{.Name}}
+func (pg *servicePlayground) handle{{.Name}}ClientStreamClose(w http.ResponseWriter, session *streamSession) {
+	// Create subject for client streaming
+	subject := "{{.Topic}}.in"
+	inbox := nats.NewInbox()
+
+	// Subscribe for final response
+	responseCh := make(chan *nats.Msg, 1)
+	sub, err := pg.nc.Subscribe(inbox, func(msg *nats.Msg) {
+		responseCh <- msg
+	})
+	if err != nil {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Subscribe error: %v", err),
+		})
+		return
+	}
+	defer sub.Unsubscribe()
+
+	// Send all buffered messages
+	for _, msgData := range session.messages {
+		// Unmarshal and remarshal to proto
+		inputMsg := &{{.InputTypeName}}{}
+		if err := protojson.Unmarshal(msgData, inputMsg); err != nil {
+			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Invalid payload: %v", err),
+			})
+			return
+		}
+
+		data, err := proto.Marshal(inputMsg)
+		if err != nil {
+			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Marshal error: %v", err),
+			})
+			return
+		}
+
+		msg := &nats.Msg{
+			Subject: subject,
+			Reply:   inbox,
+			Data:    data,
+			Header:  make(nats.Header),
+		}
+		msg.Header.Set("Stream-ID", session.streamID)
+
+		if err := pg.nc.PublishMsg(msg); err != nil {
+			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Publish error: %v", err),
+			})
+			return
+		}
+	}
+
+	// Send close signal
+	closeMsg := &nats.Msg{
+		Subject: "{{.Topic}}.close",
+		Reply:   inbox,
+		Data:    []byte{},
+		Header:  make(nats.Header),
+	}
+	closeMsg.Header.Set("Stream-ID", session.streamID)
+
+	if err := pg.nc.PublishMsg(closeMsg); err != nil {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Close error: %v", err),
+		})
+		return
+	}
+
+	// Wait for final response
+	select {
+	case respMsg := <-responseCh:
+		if errMsg := respMsg.Header.Get("X-Error"); errMsg != "" {
+			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+				Success: false,
+				Error:   errMsg,
+			})
+			return
+		}
+
+		outputMsg := &{{.OutputTypeName}}{}
+		if err := proto.Unmarshal(respMsg.Data, outputMsg); err != nil {
+			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Unmarshal error: %v", err),
+			})
+			return
+		}
+
+		jsonData, err := protojson.Marshal(outputMsg)
+		if err != nil {
+			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+				Success: false,
+				Error:   fmt.Sprintf("JSON error: %v", err),
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+			Success:  true,
+			Response: jsonData,
+		})
+
+	case <-time.After(30 * time.Second):
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+			Success: false,
+			Error:   "Timeout waiting for response",
+		})
+	}
+}
+{{end}}
+{{end}}
+
+// Bidirectional Streaming Handlers
+
+func (pg *servicePlayground) handleBidiStream(w http.ResponseWriter, r *http.Request) {
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	method := r.URL.Query().Get("method")
+	if method == "" {
+		sendSSE(w, flusher, "error", "Method required")
+		return
+	}
+
+	// Generate stream ID
+	streamID := nats.NewInbox()
+
+	// Create session
+	session := &streamSession{
+		streamID:   streamID,
+		method:     method,
+		inbox:      nats.NewInbox(),
+		messages:   make([]json.RawMessage, 0),
+		responseCh: make(chan json.RawMessage, 10),
+		errorCh:    make(chan string, 1),
+		closeCh:    make(chan struct{}),
+		createdAt:  time.Now(),
+	}
+
+	pg.mu.Lock()
+	pg.streamSessions[streamID] = session
+	pg.mu.Unlock()
+
+	defer func() {
+		pg.mu.Lock()
+		delete(pg.streamSessions, streamID)
+		pg.mu.Unlock()
+	}()
+
+	// Route to appropriate handler
+	switch method {
+{{range .Methods}}
+{{if isBidirectional .}}
+	case "{{.Name}}":
+		pg.handle{{.Name}}BidiStream(w, r, flusher, session)
+		return
+{{end}}
+{{end}}
+	}
+
+	sendSSE(w, flusher, "error", "Method not found or not bidirectional")
+}
+
+{{range .Methods}}
+{{if isBidirectional .}}
+// handle{{.Name}}BidiStream handles bidirectional streaming for {{.Name}}
+func (pg *servicePlayground) handle{{.Name}}BidiStream(w http.ResponseWriter, r *http.Request, flusher http.Flusher, session *streamSession) {
+	// Subscribe to .out channel for responses
+	outSubject := "{{.Topic}}.out"
+
+	sub, err := pg.nc.Subscribe(outSubject, func(msg *nats.Msg) {
+		// Check if this message is for our stream
+		if msg.Header.Get("Stream-ID") != session.streamID {
+			return
+		}
+
+		// Check for EOF
+		if msg.Header.Get("Stream-EOF") == "true" {
+			sendSSE(w, flusher, "close", "Stream completed")
+			close(session.closeCh)
+			return
+		}
+
+		// Check for error
+		if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
+			sendSSE(w, flusher, "error", errMsg)
+			return
+		}
+
+		// Unmarshal response
+		outputMsg := &{{.OutputTypeName}}{}
+		if err := proto.Unmarshal(msg.Data, outputMsg); err != nil {
+			sendSSE(w, flusher, "error", fmt.Sprintf("Unmarshal error: %v", err))
+			return
+		}
+
+		jsonData, err := protojson.Marshal(outputMsg)
+		if err != nil {
+			sendSSE(w, flusher, "error", fmt.Sprintf("JSON error: %v", err))
+			return
+		}
+
+		sendSSE(w, flusher, "message", string(jsonData))
+	})
+
+	if err != nil {
+		sendSSE(w, flusher, "error", fmt.Sprintf("Subscribe error: %v", err))
+		return
+	}
+	defer sub.Unsubscribe()
+
+	session.sub = sub
+
+	// Send stream ID to client
+	sendSSE(w, flusher, "started", session.streamID)
+
+	// Wait for close or timeout
+	timeout := 5 * time.Minute
+	select {
+	case <-session.closeCh:
+	case <-r.Context().Done():
+	case <-time.After(timeout):
+		sendSSE(w, flusher, "error", "Timeout")
+	}
+}
+{{end}}
+{{end}}
+
+func (pg *servicePlayground) handleBidiStreamSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req {{.Name}}StreamSendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	pg.mu.Lock()
+	session, exists := pg.streamSessions[req.StreamID]
+	pg.mu.Unlock()
+
+	if !exists {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&{{.Name}}StreamSendResponse{
+			Success: false,
+			Error:   "Stream not found",
+		})
+		return
+	}
+
+	// Route to appropriate handler
+	switch req.Method {
+{{range .Methods}}
+{{if isBidirectional .}}
+	case "{{.Name}}":
+		pg.handle{{.Name}}BidiStreamSend(w, session, req.Payload)
+		return
+{{end}}
+{{end}}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.Name}}StreamSendResponse{
+		Success: false,
+		Error:   "Method not found or not bidirectional",
+	})
+}
+
+{{range .Methods}}
+{{if isBidirectional .}}
+// handle{{.Name}}BidiStreamSend sends a message to the bidirectional stream
+func (pg *servicePlayground) handle{{.Name}}BidiStreamSend(w http.ResponseWriter, session *streamSession, payload json.RawMessage) {
+	// Unmarshal JSON to proto
+	inputMsg := &{{.InputTypeName}}{}
+	if err := protojson.Unmarshal(payload, inputMsg); err != nil {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Invalid payload: %v", err),
+		})
+		return
+	}
+
+	data, err := proto.Marshal(inputMsg)
+	if err != nil {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Marshal error: %v", err),
+		})
+		return
+	}
+
+	// Send to .in channel
+	msg := &nats.Msg{
+		Subject: "{{.Topic}}.in",
+		Data:    data,
+		Header:  make(nats.Header),
+	}
+	msg.Header.Set("Stream-ID", session.streamID)
+
+	if err := pg.nc.PublishMsg(msg); err != nil {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Publish error: %v", err),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
+		Success: true,
+	})
+}
+{{end}}
+{{end}}
+
+func (pg *servicePlayground) handleBidiStreamClose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req {{.Name}}StreamCloseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	pg.mu.Lock()
+	session, exists := pg.streamSessions[req.StreamID]
+	if exists {
+		delete(pg.streamSessions, req.StreamID)
+	}
+	pg.mu.Unlock()
+
+	if !exists {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&{{.Name}}StreamCloseResponse{
+			Success: false,
+			Error:   "Stream not found",
+		})
+		return
+	}
+
+	// Route to appropriate handler
+	switch req.Method {
+{{range .Methods}}
+{{if isBidirectional .}}
+	case "{{.Name}}":
+		pg.handle{{.Name}}BidiStreamClose(w, session)
+		return
+{{end}}
+{{end}}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.Name}}StreamCloseResponse{
+		Success: false,
+		Error:   "Method not found or not bidirectional",
+	})
+}
+
+{{range .Methods}}
+{{if isBidirectional .}}
+// handle{{.Name}}BidiStreamClose closes a bidirectional stream
+func (pg *servicePlayground) handle{{.Name}}BidiStreamClose(w http.ResponseWriter, session *streamSession) {
+	// Send close signal to .close channel
+	closeMsg := &nats.Msg{
+		Subject: "{{.Topic}}.close",
+		Data:    []byte{},
+		Header:  make(nats.Header),
+	}
+	closeMsg.Header.Set("Stream-ID", session.streamID)
+
+	if err := pg.nc.PublishMsg(closeMsg); err != nil {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Close error: %v", err),
+		})
+		return
+	}
+
+	// Unsubscribe
+	if session.sub != nil {
+		session.sub.Unsubscribe()
+	}
+
+	// Close the channel to signal SSE handler
+	close(session.closeCh)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+		Success: true,
+	})
+}
+{{end}}
+{{end}}
 
 {{template "playgroundHTML" .}}
 `))

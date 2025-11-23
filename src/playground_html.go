@@ -89,22 +89,37 @@ const playgroundHTML = `<!DOCTYPE html>
                             <div class="px-5 py-3 bg-gray-850 border-b border-gray-700 text-xs font-semibold text-gray-200 uppercase">
                                 Request
                             </div>
-                            <textarea 
+                            <textarea
                                 v-model="requestBody"
                                 class="flex-1 p-5 bg-gray-900 text-gray-300 border-0 font-mono text-sm resize-none outline-none"
                                 placeholder='{"field": "value"}'
                             ></textarea>
                             <div class="flex gap-2.5 p-3 bg-gray-850 border-t border-gray-700">
-                                <button 
+                                <button
+                                    v-if="isClientStreaming || isBidiStreaming"
+                                    @click="sendStreamMessage"
+                                    :disabled="!isStreamActive"
+                                    class="px-5 py-2.5 bg-green-600 hover:bg-green-700 disabled:bg-gray-700 disabled:cursor-not-allowed text-white rounded text-sm font-semibold transition-colors"
+                                >
+                                    Send Message
+                                </button>
+                                <button
                                     @click="executeMethod"
                                     :disabled="isExecuting"
                                     class="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:cursor-not-allowed text-white rounded text-sm font-semibold transition-colors"
                                 >
-                                    [[ isExecuting ? 'Executing...' : 'Execute' ]]
+                                    [[ getExecuteButtonLabel() ]]
                                 </button>
-                                <input 
+                                <button
+                                    v-if="(isClientStreaming || isBidiStreaming) && isStreamActive"
+                                    @click="closeStream"
+                                    class="px-5 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded text-sm font-semibold transition-colors"
+                                >
+                                    Close Stream
+                                </button>
+                                <input
                                     v-model.number="timeout"
-                                    type="number" 
+                                    type="number"
                                     placeholder="Timeout (s)"
                                     class="w-24 px-2.5 py-2 bg-gray-700 border border-gray-600 text-gray-300 rounded text-sm"
                                 >
@@ -125,11 +140,19 @@ const playgroundHTML = `<!DOCTYPE html>
 
                             <!-- Stream Messages -->
                             <div v-else-if="isStreaming" class="flex-1 overflow-y-auto p-5">
-                                <div v-for="(msg, idx) in streamMessages" :key="idx" 
-                                     :class="['bg-gray-800 border-l-2 p-3 mb-2.5 rounded font-mono text-xs', msg.error ? 'border-red-500' : 'border-blue-500']">
+                                <div v-for="(msg, idx) in streamMessages" :key="idx"
+                                     :class="['bg-gray-800 border-l-2 p-3 mb-2.5 rounded font-mono text-xs',
+                                              msg.error ? 'border-red-500' :
+                                              msg.sent ? 'border-green-500' :
+                                              msg.final ? 'border-purple-500' :
+                                              msg.system ? 'border-yellow-500' :
+                                              'border-blue-500']">
                                     <div class="flex justify-between mb-2 text-gray-500 text-[11px]">
-                                        <span v-if="msg.error">Error</span>
-										<span v-else v-text="'Message #' + (idx + 1)"></span>
+                                        <span v-if="msg.error" class="text-red-400">Error</span>
+                                        <span v-else-if="msg.sent" class="text-green-400">Sent</span>
+                                        <span v-else-if="msg.final" class="text-purple-400">Final Response</span>
+                                        <span v-else-if="msg.system" class="text-yellow-400">System</span>
+										<span v-else v-text="'Received #' + (idx + 1)"></span>
                                         <span>[[ msg.timestamp ]]ms</span>
                                     </div>
                                     <pre class="whitespace-pre-wrap">[[ msg.data ]]</pre>
@@ -177,6 +200,9 @@ createApp({
         const isStreaming = ref(false);
         const streamMessages = ref([]);
         const streamStartTime = ref(null);
+        const isStreamActive = ref(false);
+        const streamId = ref(null);
+        const eventSource = ref(null);
 
         // Methods
         const loadMethods = async () => {
@@ -194,6 +220,31 @@ createApp({
             response.value = null;
             streamMessages.value = [];
             isStreaming.value = false;
+            isStreamActive.value = false;
+            streamId.value = null;
+            if (eventSource.value) {
+                eventSource.value.close();
+                eventSource.value = null;
+            }
+        };
+
+        const isClientStreaming = computed(() => {
+            return selectedMethod.value &&
+                   (selectedMethod.value.streamType === 'CLIENT_STREAMING' ||
+                    selectedMethod.value.streamType === 'BIDI_STREAMING');
+        });
+
+        const isBidiStreaming = computed(() => {
+            return selectedMethod.value && selectedMethod.value.streamType === 'BIDI_STREAMING';
+        });
+
+        const getExecuteButtonLabel = () => {
+            if (isExecuting.value) return 'Executing...';
+            if (isStreamActive.value) return 'Stream Active';
+            if (isClientStreaming.value || isBidiStreaming.value) {
+                return 'Start Stream';
+            }
+            return 'Execute';
         };
 
         const getStreamTypeClass = (type) => {
@@ -301,6 +352,204 @@ createApp({
             isStreaming.value = false;
         };
 
+        const executeClientStream = async (payload) => {
+            // Initialize client stream
+            const res = await fetch('/api/client-stream/init', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    method: selectedMethod.value.name,
+                    headers: {},
+                    timeout: timeout.value
+                })
+            });
+
+            const result = await res.json();
+            if (!result.success) {
+                response.value = {
+                    error: true,
+                    data: result.error,
+                    duration: 0
+                };
+                return;
+            }
+
+            streamId.value = result.streamId;
+            isStreamActive.value = true;
+            isStreaming.value = true;
+            streamStartTime.value = Date.now();
+
+            // Send first message
+            await sendStreamMessage();
+        };
+
+        const executeBidiStream = async (payload) => {
+            isStreaming.value = true;
+            streamStartTime.value = Date.now();
+
+            const url = '/api/bidi-stream?method=' + encodeURIComponent(selectedMethod.value.name) +
+                        '&timeout=' + timeout.value;
+
+            eventSource.value = new EventSource(url);
+
+            eventSource.value.addEventListener('started', (e) => {
+                streamId.value = e.data;
+                isStreamActive.value = true;
+                streamMessages.value.push({
+                    data: 'Stream started with ID: ' + e.data,
+                    timestamp: Date.now() - streamStartTime.value,
+                    error: false,
+                    system: true
+                });
+            });
+
+            eventSource.value.addEventListener('message', (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    streamMessages.value.push({
+                        data: JSON.stringify(data, null, 2),
+                        timestamp: Date.now() - streamStartTime.value,
+                        error: false
+                    });
+                } catch (err) {
+                    streamMessages.value.push({
+                        data: e.data,
+                        timestamp: Date.now() - streamStartTime.value,
+                        error: false
+                    });
+                }
+            });
+
+            eventSource.value.addEventListener('error', (e) => {
+                const errorData = e.data || 'Stream error occurred';
+                streamMessages.value.push({
+                    data: errorData,
+                    timestamp: Date.now() - streamStartTime.value,
+                    error: true
+                });
+            });
+
+            eventSource.value.addEventListener('close', (e) => {
+                isStreamActive.value = false;
+                isStreaming.value = false;
+                response.value = {
+                    error: false,
+                    data: '',
+                    duration: Date.now() - streamStartTime.value
+                };
+                if (eventSource.value) {
+                    eventSource.value.close();
+                    eventSource.value = null;
+                }
+            });
+
+            eventSource.value.onerror = () => {
+                isStreamActive.value = false;
+                isStreaming.value = false;
+                if (eventSource.value) {
+                    eventSource.value.close();
+                    eventSource.value = null;
+                }
+            };
+        };
+
+        const sendStreamMessage = async () => {
+            if (!isStreamActive.value || !streamId.value) return;
+
+            try {
+                const payload = JSON.parse(requestBody.value);
+                const endpoint = isBidiStreaming.value ? '/api/bidi-stream/send' : '/api/client-stream/send';
+
+                const res = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        streamId: streamId.value,
+                        method: selectedMethod.value.name,
+                        payload: payload
+                    })
+                });
+
+                const result = await res.json();
+                if (!result.success) {
+                    streamMessages.value.push({
+                        data: 'Failed to send: ' + result.error,
+                        timestamp: Date.now() - streamStartTime.value,
+                        error: true
+                    });
+                } else {
+                    streamMessages.value.push({
+                        data: 'Sent: ' + JSON.stringify(payload, null, 2),
+                        timestamp: Date.now() - streamStartTime.value,
+                        error: false,
+                        sent: true
+                    });
+                }
+            } catch (error) {
+                streamMessages.value.push({
+                    data: 'Error: ' + error.message,
+                    timestamp: Date.now() - streamStartTime.value,
+                    error: true
+                });
+            }
+        };
+
+        const closeStream = async () => {
+            if (!isStreamActive.value || !streamId.value) return;
+
+            try {
+                const endpoint = isBidiStreaming.value ? '/api/bidi-stream/close' : '/api/client-stream/close';
+
+                const res = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        streamId: streamId.value,
+                        method: selectedMethod.value.name
+                    })
+                });
+
+                const result = await res.json();
+
+                if (result.success) {
+                    if (!isBidiStreaming.value && result.response) {
+                        // For client streaming, show final response
+                        streamMessages.value.push({
+                            data: JSON.stringify(result.response, null, 2),
+                            timestamp: Date.now() - streamStartTime.value,
+                            error: false,
+                            final: true
+                        });
+                    }
+                    response.value = {
+                        error: false,
+                        data: result.response ? JSON.stringify(result.response, null, 2) : 'Stream closed',
+                        duration: Date.now() - streamStartTime.value
+                    };
+                } else {
+                    response.value = {
+                        error: true,
+                        data: result.error,
+                        duration: Date.now() - streamStartTime.value
+                    };
+                }
+            } catch (error) {
+                response.value = {
+                    error: true,
+                    data: error.message,
+                    duration: Date.now() - streamStartTime.value
+                };
+            } finally {
+                isStreamActive.value = false;
+                isStreaming.value = false;
+                streamId.value = null;
+                if (eventSource.value) {
+                    eventSource.value.close();
+                    eventSource.value = null;
+                }
+            }
+        };
+
         const executeMethod = async () => {
             if (!selectedMethod.value) return;
 
@@ -315,6 +564,10 @@ createApp({
                     await executeServerStream(payload);
                 } else if (selectedMethod.value.streamType === 'UNARY') {
                     await executeUnary(payload);
+                } else if (selectedMethod.value.streamType === 'CLIENT_STREAMING') {
+                    await executeClientStream(payload);
+                } else if (selectedMethod.value.streamType === 'BIDI_STREAMING') {
+                    await executeBidiStream(payload);
                 } else {
                     const msg = selectedMethod.value.streamType + " not yet supported";
                     throw new Error(msg);
@@ -342,11 +595,19 @@ createApp({
             isStreaming,
             streamMessages,
             streamStartTime,
+            isStreamActive,
+            streamId,
+            eventSource,
             loadMethods,
             onMethodSelect,
             getStreamTypeClass,
             formatStreamType,
-            executeMethod
+            executeMethod,
+            sendStreamMessage,
+            closeStream,
+            isClientStreaming,
+            isBidiStreaming,
+            getExecuteButtonLabel
         };
     }
 })
