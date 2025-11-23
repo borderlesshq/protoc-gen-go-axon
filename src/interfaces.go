@@ -719,8 +719,8 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 	// Subscribe to data messages with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
-		seqNum := msg.Header.Get("Seq-Num")
-		
+		_ = msg.Header.Get("Seq-Num") // Retrieved but not used for ordering (yet)
+
 		streamAggregator.mu.Lock()
 		buf, exists := streamAggregator.streams[streamID]
 		if !exists {
