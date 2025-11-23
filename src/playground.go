@@ -106,7 +106,7 @@ func (pg *servicePlayground) handleListMethods(w http.ResponseWriter, r *http.Re
 {{range .Methods}}
 		{
 			Name:       "{{.Name}}",
-			StreamType: "{{if isUnary .}}UNARY{{else if isServerStreaming .}}SERVER_STREAMING{{else if isClientStreaming .}}CLIENT_STREAMING{{else}}BIDIRECTIONAL{{end}}",
+			StreamType: "{{if isUnary .}}UNARY{{else if isServerStreaming .}}SERVER_STREAMING{{else if isClientStreaming .}}CLIENT_STREAMING{{else}}BIDI_STREAMING{{end}}",
 			InputType:  "{{.InputTypeName}}",
 			OutputType: "{{.OutputTypeName}}",
 			Topic:      "{{.Topic}}",
@@ -572,8 +572,8 @@ func (pg *servicePlayground) handleClientStreamClose(w http.ResponseWriter, r *h
 {{if isClientStreaming .}}
 // handle{{.Name}}ClientStreamClose handles closing a client stream for {{.Name}}
 func (pg *servicePlayground) handle{{.Name}}ClientStreamClose(w http.ResponseWriter, session *streamSession) {
-	// Create subject for client streaming
-	subject := "{{.Topic}}.in"
+	// Create subject for client streaming (base topic, not .in)
+	subject := "{{.Topic}}"
 	inbox := nats.NewInbox()
 
 	// Subscribe for final response
@@ -590,7 +590,7 @@ func (pg *servicePlayground) handle{{.Name}}ClientStreamClose(w http.ResponseWri
 	}
 	defer sub.Unsubscribe()
 
-	// Send all buffered messages
+	// Send all buffered messages to the base topic
 	for _, msgData := range session.messages {
 		// Unmarshal and remarshal to proto
 		inputMsg := &{{.InputTypeName}}{}
@@ -800,6 +800,19 @@ func (pg *servicePlayground) handle{{.Name}}BidiStream(w http.ResponseWriter, r 
 	defer sub.Unsubscribe()
 
 	session.sub = sub
+
+	// Send initialization message to start the server stream
+	initMsg := &nats.Msg{
+		Subject: "{{.Topic}}.init",
+		Data:    []byte{},
+		Header:  make(nats.Header),
+	}
+	initMsg.Header.Set("Stream-ID", session.streamID)
+
+	if err := pg.nc.PublishMsg(initMsg); err != nil {
+		sendSSE(w, flusher, "error", fmt.Sprintf("Init error: %v", err))
+		return
+	}
 
 	// Send stream ID to client
 	sendSSE(w, flusher, "started", session.streamID)
