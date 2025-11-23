@@ -519,9 +519,6 @@ func (pg *servicePlayground) handleClientStreamClose(w http.ResponseWriter, r *h
 
 	pg.mu.Lock()
 	session, exists := pg.streamSessions[req.StreamID]
-	if exists {
-		delete(pg.streamSessions, req.StreamID)
-	}
 	pg.mu.Unlock()
 
 	if !exists {
@@ -533,6 +530,13 @@ func (pg *servicePlayground) handleClientStreamClose(w http.ResponseWriter, r *h
 		return
 	}
 
+	// Cleanup session after handler completes
+	defer func() {
+		pg.mu.Lock()
+		delete(pg.streamSessions, req.StreamID)
+		pg.mu.Unlock()
+	}()
+
 	// Route to appropriate handler
 	switch req.Method {
 {{range .Methods}}
@@ -542,13 +546,13 @@ func (pg *servicePlayground) handleClientStreamClose(w http.ResponseWriter, r *h
 		return
 {{end}}
 {{end}}
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&{{.Name}}StreamCloseResponse{
+			Success: false,
+			Error:   "Method not found or not client streaming",
+		})
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(&{{.Name}}StreamCloseResponse{
-		Success: false,
-		Error:   "Method not found or not client streaming",
-	})
 }
 
 {{range .Methods}}
@@ -901,9 +905,6 @@ func (pg *servicePlayground) handleBidiStreamClose(w http.ResponseWriter, r *htt
 
 	pg.mu.Lock()
 	session, exists := pg.streamSessions[req.StreamID]
-	if exists {
-		delete(pg.streamSessions, req.StreamID)
-	}
 	pg.mu.Unlock()
 
 	if !exists {
@@ -915,6 +916,13 @@ func (pg *servicePlayground) handleBidiStreamClose(w http.ResponseWriter, r *htt
 		return
 	}
 
+	// Cleanup session after handler completes
+	defer func() {
+		pg.mu.Lock()
+		delete(pg.streamSessions, req.StreamID)
+		pg.mu.Unlock()
+	}()
+
 	// Route to appropriate handler
 	switch req.Method {
 {{range .Methods}}
@@ -924,13 +932,13 @@ func (pg *servicePlayground) handleBidiStreamClose(w http.ResponseWriter, r *htt
 		return
 {{end}}
 {{end}}
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&{{.Name}}StreamCloseResponse{
+			Success: false,
+			Error:   "Method not found or not bidirectional",
+		})
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(&{{.Name}}StreamCloseResponse{
-		Success: false,
-		Error:   "Method not found or not bidirectional",
-	})
 }
 
 {{range .Methods}}
