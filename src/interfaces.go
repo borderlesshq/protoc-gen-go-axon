@@ -403,7 +403,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 		requestData:    data,
 		requestHeaders: requestHeaders,
 		topic:          "{{.Topic}}",
-		lastSeqNum:     0,
 		stopMonitor:    make(chan struct{}),
 	}
 
@@ -491,7 +490,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 		responseSub: responseSub,
 		ctx:         ctx,
 		span:        span,
-		seqNum:      0,
 	}, nil
 }
 {{else}}
@@ -523,7 +521,6 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 		errCh:       errCh,
 		ctx:         ctx,
 		span:        span,
-		seqNum:      0,
 		stopMonitor: make(chan struct{}),
 	}
 
@@ -672,18 +669,9 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 			return
 		}
 
-		// Check if client wants to resume from a specific sequence
-		var startSeq uint64 = 0
-		if resumeSeq := msg.Header.Get("Resume-From-Seq"); resumeSeq != "" {
-			if seq, err := strconv.ParseUint(resumeSeq, 10, 64); err == nil {
-				startSeq = seq
-			}
-		}
-
 		stream := &{{streamImplType .ServiceName .Name "Server"}}{
 			nc:     nc,
 			reply:  msg.Reply,
-			seqNum: startSeq,
 		}
 
 		if err := srv.{{.Name}}(req, stream); err != nil {
@@ -719,7 +707,6 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 	// Subscribe to data messages with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
-		_ = msg.Header.Get("Seq-Num") // Retrieved but not used for ordering (yet)
 
 		streamAggregator.mu.Lock()
 		buf, exists := streamAggregator.streams[streamID]
@@ -828,22 +815,10 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 			attribute.String("stream.type", "bidirectional"),
 		)
 
-		// Check if client wants to resume from a specific sequence
-		var startSeq uint64 = 0
-		if resumeSeq := msg.Header.Get("Resume-From-Seq"); resumeSeq != "" {
-			if seq, err := strconv.ParseUint(resumeSeq, 10, 64); err == nil {
-				startSeq = seq
-			}
-		}
-
 		// Check if stream already exists (reconnection scenario)
 		streamManager.mu.Lock()
 		existingStream := streamManager.streams[streamID]
 		if existingStream != nil {
-			// Update sequence number for resume
-			existingStream.mu.Lock()
-			existingStream.seqNum = startSeq
-			existingStream.mu.Unlock()
 			streamManager.mu.Unlock()
 			return
 		}
@@ -853,7 +828,6 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 			streamID:    streamID,
 			recvCh:      make(chan {{.InputType}}, 10),
 			sendSubject: streamID + ".out",
-			seqNum:      startSeq,
 		}
 
 		streamManager.streams[streamID] = stream
@@ -938,7 +912,6 @@ type {{streamType .ServiceName .Name "Server"}} interface {
 type {{streamImplType .ServiceName .Name "Server"}} struct {
 	nc     *nats.Conn
 	reply  string
-	seqNum uint64
 	mu     sync.Mutex
 }
 
@@ -951,15 +924,9 @@ func (s *{{streamImplType .ServiceName .Name "Server"}}) Send(msg {{.OutputType}
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	// Add sequence number to track message order
-	header := nats.Header{}
-	header.Set("Seq-Num", strconv.FormatUint(s.seqNum, 10))
-	s.seqNum++
-
 	return s.nc.PublishMsg(&nats.Msg{
 		Subject: s.reply,
 		Data:    data,
-		Header:  header,
 	})
 }
 
@@ -991,7 +958,6 @@ type {{streamImplType .ServiceName .Name "Client"}} struct {
 	span             trace.Span
 	mu               sync.Mutex
 	closed           bool
-	lastSeqNum       uint64
 	reconnecting     bool
 	inbox            string
 	requestData      []byte
@@ -1066,18 +1032,12 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
 	}
 	s.sub = sub
 
-	// Resend request with resume sequence number
-	resumeHeaders := nats.Header{}
-	for k, v := range s.requestHeaders {
-		resumeHeaders[k] = v
-	}
-	resumeHeaders.Set("Resume-From-Seq", strconv.FormatUint(s.lastSeqNum, 10))
-
+	// Resend request
 	if err := s.nc.PublishMsg(&nats.Msg{
 		Subject: s.topic,
 		Reply:   s.inbox,
 		Data:    s.requestData,
-		Header:  resumeHeaders,
+		Header:  s.requestHeaders,
 	}); err != nil {
 		return fmt.Errorf("failed to republish request: %w", err)
 	}
@@ -1124,7 +1084,6 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg
 	// Check for EOF signal
 	if msg.Header.Get("Stream-EOF") == "true" {
 		if tracingEnabled {
-			s.span.SetAttributes(attribute.Int("stream.messages_received", int(s.lastSeqNum)))
 			s.span.SetStatus(codes.Ok, "")
 			s.span.End()
 		}
@@ -1160,15 +1119,6 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg
 		return
 	}
 
-	// Track sequence number (no lock needed for atomic read/write)
-	if seqStr := msg.Header.Get("Seq-Num"); seqStr != "" {
-		if seq, err := strconv.ParseUint(seqStr, 10, 64); err == nil {
-			s.mu.Lock()
-			s.lastSeqNum = seq + 1
-			s.mu.Unlock()
-		}
-	}
-
 	select {
 	case s.recvCh <- out:
 	case <-s.ctx.Done():
@@ -1196,7 +1146,6 @@ type {{streamImplType .ServiceName .Name "Client"}} struct {
 	responseSub *nats.Subscription
 	ctx         context.Context
 	span        trace.Span
-	seqNum      uint64
 	sentCount   int
 	mu          sync.Mutex
 	closed      bool
@@ -1217,8 +1166,6 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) Send(msg {{.InputType}}
 
 	header := nats.Header{}
 	header.Set("Stream-ID", s.streamID)
-	header.Set("Seq-Num", strconv.FormatUint(s.seqNum, 10))
-	s.seqNum++
 	s.sentCount++
 
 	return s.nc.PublishMsg(&nats.Msg{
@@ -1359,8 +1306,6 @@ type {{streamImplType .ServiceName .Name "Client"}} struct {
 	sub              *nats.Subscription
 	ctx              context.Context
 	span             trace.Span
-	seqNum           uint64
-	lastRecvSeq      uint64
 	mu               sync.Mutex
 	closed           bool
 	reconnecting     bool
@@ -1383,8 +1328,6 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) Send(msg {{.InputType}}
 
 	header := nats.Header{}
 	header.Set("Stream-ID", s.streamID)
-	header.Set("Seq-Num", strconv.FormatUint(s.seqNum, 10))
-	s.seqNum++
 
 	return s.nc.PublishMsg(&nats.Msg{
 		Subject: s.topic + ".in",
@@ -1468,10 +1411,9 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) reconnect() error {
 	}
 	s.sub = sub
 
-	// Reinitialize stream with resume sequence
+	// Reinitialize stream
 	header := nats.Header{}
 	header.Set("Stream-ID", s.streamID)
-	header.Set("Resume-From-Seq", strconv.FormatUint(s.lastRecvSeq, 10))
 
 	if err := s.nc.PublishMsg(&nats.Msg{
 		Subject: s.topic + ".init",
@@ -1557,15 +1499,6 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleRecvMessage(msg *
 		return
 	}
 
-	// Track sequence number
-	if seqStr := msg.Header.Get("Seq-Num"); seqStr != "" {
-		if seq, err := strconv.ParseUint(seqStr, 10, 64); err == nil {
-			s.mu.Lock()
-			s.lastRecvSeq = seq + 1
-			s.mu.Unlock()
-		}
-	}
-
 	select {
 	case s.recvCh <- out:
 	case <-s.ctx.Done():
@@ -1588,7 +1521,6 @@ type {{streamImplType .ServiceName .Name "Server"}} struct {
 	streamID    string
 	recvCh      chan {{.InputType}}
 	sendSubject string
-	seqNum      uint64
 	mu          sync.Mutex
 	closed      bool
 }
@@ -1606,10 +1538,8 @@ func (s *{{streamImplType .ServiceName .Name "Server"}}) Send(msg {{.OutputType}
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	// Add sequence number for tracking
 	header := nats.Header{}
-	header.Set("Seq-Num", strconv.FormatUint(s.seqNum, 10))
-	s.seqNum++
+	header.Set("Stream-ID", s.streamID)
 
 	return s.nc.PublishMsg(&nats.Msg{
 		Subject: s.sendSubject,
