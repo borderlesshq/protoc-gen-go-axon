@@ -52,13 +52,19 @@ func enablePlayground(nc *nats.Conn, addr string) *servicePlayground {
 	mux.HandleFunc("/", pg.handleUI)
 	mux.HandleFunc("/api/methods", pg.handleListMethods)
 	mux.HandleFunc("/api/invoke", pg.handleInvoke)
+{{if hasServerStreaming .Methods}}
 	mux.HandleFunc("/api/stream", pg.handleStream)
+{{end}}
+{{if hasClientStreaming .Methods}}
 	mux.HandleFunc("/api/client-stream/init", pg.handleClientStreamInit)
 	mux.HandleFunc("/api/client-stream/send", pg.handleClientStreamSend)
 	mux.HandleFunc("/api/client-stream/close", pg.handleClientStreamClose)
+{{end}}
+{{if hasBidirectional .Methods}}
 	mux.HandleFunc("/api/bidi-stream", pg.handleBidiStream)
 	mux.HandleFunc("/api/bidi-stream/send", pg.handleBidiStreamSend)
 	mux.HandleFunc("/api/bidi-stream/close", pg.handleBidiStreamClose)
+{{end}}
 	
 	pg.server = &http.Server{
 		Addr:    addr,
@@ -258,6 +264,7 @@ func (pg *servicePlayground) handle{{.Name}}Invoke(w http.ResponseWriter, req *{
 {{end}}
 {{end}}
 
+{{if hasServerStreaming .Methods}}
 // handleStream handles streaming RPCs
 func (pg *servicePlayground) handleStream(w http.ResponseWriter, r *http.Request) {
 	// Set SSE headers
@@ -379,6 +386,7 @@ func (pg *servicePlayground) handle{{.Name}}Stream(w http.ResponseWriter, r *htt
 }
 {{end}}
 {{end}}
+{{end}}
 
 // Helper functions
 func sendSSE(w http.ResponseWriter, flusher http.Flusher, event, data string) {
@@ -397,6 +405,7 @@ func headerToMap(h nats.Header) map[string]string {
 	return m
 }
 
+{{if hasClientStreaming .Methods}}
 // Client Streaming Handlers
 
 type {{.Name}}ClientStreamInitRequest struct {
@@ -676,7 +685,9 @@ func (pg *servicePlayground) handle{{.Name}}ClientStreamClose(w http.ResponseWri
 }
 {{end}}
 {{end}}
+{{end}}
 
+{{if hasBidirectional .Methods}}
 // Bidirectional Streaming Handlers
 
 func (pg *servicePlayground) handleBidiStream(w http.ResponseWriter, r *http.Request) {
@@ -974,6 +985,7 @@ func (pg *servicePlayground) handle{{.Name}}BidiStreamClose(w http.ResponseWrite
 		Success: true,
 	})
 }
+{{end}}
 {{end}}
 {{end}}
 

@@ -58,6 +58,31 @@ var templateFuncs = template.FuncMap{
 	"isBidirectional": func(m *MethodData) bool {
 		return m.IsClientStreaming && m.IsServerStreaming
 	},
+	// Helper functions to check if service has specific streaming types
+	"hasServerStreaming": func(methods []*MethodData) bool {
+		for _, m := range methods {
+			if !m.IsClientStreaming && m.IsServerStreaming {
+				return true
+			}
+		}
+		return false
+	},
+	"hasClientStreaming": func(methods []*MethodData) bool {
+		for _, m := range methods {
+			if m.IsClientStreaming && !m.IsServerStreaming {
+				return true
+			}
+		}
+		return false
+	},
+	"hasBidirectional": func(methods []*MethodData) bool {
+		for _, m := range methods {
+			if m.IsClientStreaming && m.IsServerStreaming {
+				return true
+			}
+		}
+		return false
+	},
 }
 
 // Main template for the entire file
