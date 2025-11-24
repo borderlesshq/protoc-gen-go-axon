@@ -22,6 +22,8 @@ service AccountService {
   rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
 
   rpc StreamWalletUpdates(stream GetByIdRequest) returns (stream Wallet);
+   rpc StreamWalletUpdatesFromServer(GetByIdRequest) returns (stream Wallet);
+   rpc StreamWalletUpdatesFromClient(stream GetByIdRequest) returns (Wallet);
 //  rpc CreditAccount(CreditAccountRequest) returns (CreditAccountResponse);
 //  rpc DebitAccount(DebitAccountRequest) returns (DebitAccountResponse);
 }
