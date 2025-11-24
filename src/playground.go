@@ -18,10 +18,8 @@ var _ = template.Must(FileTemplate.New("playgroundSupport").Parse(`
 type streamSession struct {
 	streamID    string
 	method      string
-	inbox       string
-	messages    []json.RawMessage
-	responseCh  chan json.RawMessage
-	errorCh     chan string
+	clientStream interface{}  // Stores the generated client stream object
+	bidiStream  interface{}   // Stores bidirectional stream object
 	closeCh     chan struct{}
 	sub         *nats.Subscription
 	createdAt   time.Time
@@ -30,21 +28,23 @@ type streamSession struct {
 // servicePlayground provides a web interface for testing {{.Name}} methods
 type servicePlayground struct {
 	nc            *nats.Conn
+	client        {{.Name}}Client
 	server        *http.Server
 	mu            sync.Mutex
 	streamSessions map[string]*streamSession
 }
 
 // EnablePlayground starts an HTTP server with a web UI for testing this service
-// 
+//
 // Example:
 //   playground := cards.EnablePlayground(nc, ":8080")
 //   defer playground.Shutdown(context.Background())
-// 
+//
 // Then open http://localhost:8080 in your browser
 func enablePlayground(nc *nats.Conn, addr string) *servicePlayground {
 	pg := &servicePlayground{
 		nc:            nc,
+		client:        New{{.Name}}Client(nc),
 		streamSessions: make(map[string]*streamSession),
 	}
 	
@@ -175,42 +175,21 @@ func (pg *servicePlayground) handle{{.Name}}Invoke(w http.ResponseWriter, req *{
 		})
 		return
 	}
-	
-	// Marshal to protobuf
-	data, err := proto.Marshal(inputMsg)
-	if err != nil {
-		json.NewEncoder(w).Encode(&{{.ServiceName}}InvokeResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Marshal error: %v", err),
-		})
-		return
-	}
-	
+
 	// Set timeout
 	timeout := time.Duration(req.Timeout) * time.Second
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	
-	// Create NATS message with headers
-	msg := &nats.Msg{
-		Subject: "{{.Topic}}",
-		Data:    data,
-		Header:  make(nats.Header),
-	}
-	
-	for k, v := range req.Headers {
-		msg.Header.Set(k, v)
-	}
-	
-	// Invoke RPC
+
+	// Invoke RPC using generated client
 	start := time.Now()
-	respMsg, err := pg.nc.RequestMsgWithContext(ctx, msg)
+	outputMsg, err := pg.client.{{.Name}}(ctx, inputMsg)
 	duration := time.Since(start)
-	
+
 	if err != nil {
 		json.NewEncoder(w).Encode(&{{.ServiceName}}InvokeResponse{
 			Success:    false,
@@ -219,29 +198,7 @@ func (pg *servicePlayground) handle{{.Name}}Invoke(w http.ResponseWriter, req *{
 		})
 		return
 	}
-	
-	// Check for error in headers
-	if errMsg := respMsg.Header.Get("X-Error"); errMsg != "" {
-		json.NewEncoder(w).Encode(&{{.ServiceName}}InvokeResponse{
-			Success:    false,
-			Error:      errMsg,
-			Headers:    headerToMap(respMsg.Header),
-			DurationMs: duration.Milliseconds(),
-		})
-		return
-	}
-	
-	// Unmarshal response
-	outputMsg := &{{.OutputTypeName}}{}
-	if err := proto.Unmarshal(respMsg.Data, outputMsg); err != nil {
-		json.NewEncoder(w).Encode(&{{.ServiceName}}InvokeResponse{
-			Success:    false,
-			Error:      fmt.Sprintf("Unmarshal error: %v", err),
-			DurationMs: duration.Milliseconds(),
-		})
-		return
-	}
-	
+
 	// Convert to JSON
 	jsonData, err := protojson.Marshal(outputMsg)
 	if err != nil {
@@ -252,12 +209,11 @@ func (pg *servicePlayground) handle{{.Name}}Invoke(w http.ResponseWriter, req *{
 		})
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(&{{.ServiceName}}InvokeResponse{
 		Success:    true,
 		Response:   jsonData,
-		Headers:    headerToMap(respMsg.Header),
 		DurationMs: duration.Milliseconds(),
 	})
 }
@@ -307,81 +263,45 @@ func (pg *servicePlayground) handle{{.Name}}Stream(w http.ResponseWriter, r *htt
 		sendSSE(w, flusher, "error", fmt.Sprintf("Invalid payload: %v", err))
 		return
 	}
-	
-	data, err := proto.Marshal(inputMsg)
+
+	// Set timeout
+	timeout := time.Duration(req.Timeout) * time.Second
+	if timeout == 0 {
+		timeout = 5 * time.Minute
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	// Call server streaming method using generated client
+	stream, err := pg.client.{{.Name}}(ctx, inputMsg)
 	if err != nil {
-		sendSSE(w, flusher, "error", fmt.Sprintf("Marshal error: %v", err))
+		sendSSE(w, flusher, "error", fmt.Sprintf("Stream initiation error: %v", err))
 		return
 	}
-	
-	// Create unique inbox
-	inbox := nats.NewInbox()
-	
-	// Subscribe to responses
-	sub, err := pg.nc.Subscribe(inbox, func(msg *nats.Msg) {
-		// Check for EOF
-		if msg.Header.Get("Stream-EOF") == "true" {
+	defer stream.CloseSend()
+
+	sendSSE(w, flusher, "started", "Stream started")
+
+	// Receive messages from stream
+	for {
+		outputMsg, err := stream.Recv()
+		if err == io.EOF {
 			sendSSE(w, flusher, "close", "Stream completed")
 			return
 		}
-		
-		// Check for error
-		if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
-			sendSSE(w, flusher, "error", errMsg)
+		if err != nil {
+			sendSSE(w, flusher, "error", err.Error())
 			return
 		}
-		
-		// Unmarshal response
-		outputMsg := &{{.OutputTypeName}}{}
-		if err := proto.Unmarshal(msg.Data, outputMsg); err != nil {
-			sendSSE(w, flusher, "error", fmt.Sprintf("Unmarshal error: %v", err))
-			return
-		}
-		
+
 		jsonData, err := protojson.Marshal(outputMsg)
 		if err != nil {
 			sendSSE(w, flusher, "error", fmt.Sprintf("JSON error: %v", err))
 			return
 		}
-		
+
 		sendSSE(w, flusher, "message", string(jsonData))
-	})
-	
-	if err != nil {
-		sendSSE(w, flusher, "error", fmt.Sprintf("Subscribe error: %v", err))
-		return
-	}
-	defer sub.Unsubscribe()
-	
-	// Send request
-	msg := &nats.Msg{
-		Subject: "{{.Topic}}",
-		Reply:   inbox,
-		Data:    data,
-		Header:  make(nats.Header),
-	}
-	
-	for k, v := range req.Headers {
-		msg.Header.Set(k, v)
-	}
-	
-	if err := pg.nc.PublishMsg(msg); err != nil {
-		sendSSE(w, flusher, "error", fmt.Sprintf("Publish error: %v", err))
-		return
-	}
-	
-	sendSSE(w, flusher, "started", "Stream started")
-	
-	// Wait for client disconnect or timeout
-	timeout := time.Duration(req.Timeout) * time.Second
-	if timeout == 0 {
-		timeout = 5 * time.Minute
-	}
-	
-	select {
-	case <-r.Context().Done():
-	case <-time.After(timeout):
-		sendSSE(w, flusher, "error", "Timeout")
 	}
 }
 {{end}}
@@ -458,30 +378,22 @@ func (pg *servicePlayground) handleClientStreamInit(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Generate stream ID
-	streamID := nats.NewInbox()
-
-	// Create session
-	session := &streamSession{
-		streamID:   streamID,
-		method:     req.Method,
-		inbox:      nats.NewInbox(),
-		messages:   make([]json.RawMessage, 0),
-		responseCh: make(chan json.RawMessage, 10),
-		errorCh:    make(chan string, 1),
-		closeCh:    make(chan struct{}),
-		createdAt:  time.Now(),
+	// Route to appropriate init handler
+	switch req.Method {
+{{range .Methods}}
+{{if isClientStreaming .}}
+	case "{{.Name}}":
+		pg.handle{{.Name}}ClientStreamInit(w, &req)
+		return
+{{end}}
+{{end}}
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&{{.Name}}ClientStreamInitResponse{
+			Success: false,
+			Error:   "Method not found or not client streaming",
+		})
 	}
-
-	pg.mu.Lock()
-	pg.streamSessions[streamID] = session
-	pg.mu.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(&{{.Name}}ClientStreamInitResponse{
-		Success:  true,
-		StreamID: streamID,
-	})
 }
 
 func (pg *servicePlayground) handleClientStreamSend(w http.ResponseWriter, r *http.Request) {
@@ -509,13 +421,22 @@ func (pg *servicePlayground) handleClientStreamSend(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Store message
-	session.messages = append(session.messages, req.Payload)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(&{{.Name}}StreamSendResponse{
-		Success: true,
-	})
+	// Route to appropriate send handler
+	switch req.Method {
+{{range .Methods}}
+{{if isClientStreaming .}}
+	case "{{.Name}}":
+		pg.handle{{.Name}}ClientStreamSend(w, session, req.Payload)
+		return
+{{end}}
+{{end}}
+	default:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&{{.Name}}StreamSendResponse{
+			Success: false,
+			Error:   "Method not found or not client streaming",
+		})
+	}
 }
 
 func (pg *servicePlayground) handleClientStreamClose(w http.ResponseWriter, r *http.Request) {
@@ -570,122 +491,134 @@ func (pg *servicePlayground) handleClientStreamClose(w http.ResponseWriter, r *h
 
 {{range .Methods}}
 {{if isClientStreaming .}}
-// handle{{.Name}}ClientStreamClose handles closing a client stream for {{.Name}}
-func (pg *servicePlayground) handle{{.Name}}ClientStreamClose(w http.ResponseWriter, session *streamSession) {
-	// Create subject for client streaming (base topic, not .in)
-	subject := "{{.Topic}}"
-	inbox := nats.NewInbox()
+// handle{{.Name}}ClientStreamInit initializes a client stream for {{.Name}}
+func (pg *servicePlayground) handle{{.Name}}ClientStreamInit(w http.ResponseWriter, req *{{.ServiceName}}ClientStreamInitRequest) {
+	// Set timeout
+	timeout := time.Duration(req.Timeout) * time.Second
+	if timeout == 0 {
+		timeout = 5 * time.Minute
+	}
 
-	// Subscribe for final response
-	responseCh := make(chan *nats.Msg, 1)
-	sub, err := pg.nc.Subscribe(inbox, func(msg *nats.Msg) {
-		responseCh <- msg
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// Don't cancel immediately - store it in session for later cleanup
+
+	// Create client stream using generated client
+	stream, err := pg.client.{{.Name}}(ctx, nil)
+	if err != nil {
+		cancel()
+		json.NewEncoder(w).Encode(&{{.ServiceName}}ClientStreamInitResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Stream initiation error: %v", err),
+		})
+		return
+	}
+
+	// Generate stream ID
+	streamID := nats.NewInbox()
+
+	// Create session to store the stream
+	session := &streamSession{
+		streamID:     streamID,
+		method:       req.Method,
+		clientStream: stream,
+		closeCh:      make(chan struct{}),
+		createdAt:    time.Now(),
+	}
+
+	pg.mu.Lock()
+	pg.streamSessions[streamID] = session
+	pg.mu.Unlock()
+
+	// Store cancel function for cleanup
+	go func() {
+		<-session.closeCh
+		cancel()
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.ServiceName}}ClientStreamInitResponse{
+		Success:  true,
+		StreamID: streamID,
 	})
+}
+
+// handle{{.Name}}ClientStreamSend sends a message to the client stream
+func (pg *servicePlayground) handle{{.Name}}ClientStreamSend(w http.ResponseWriter, session *streamSession, payload json.RawMessage) {
+	// Get the stream from session
+	stream, ok := session.clientStream.({{.ServiceName}}_{{.Name}}Client)
+	if !ok {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
+			Success: false,
+			Error:   "Invalid stream type",
+		})
+		return
+	}
+
+	// Unmarshal JSON to proto
+	inputMsg := &{{.InputTypeName}}{}
+	if err := protojson.Unmarshal(payload, inputMsg); err != nil {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Invalid payload: %v", err),
+		})
+		return
+	}
+
+	// Send message using generated client stream
+	if err := stream.Send(inputMsg); err != nil {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Send error: %v", err),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
+		Success: true,
+	})
+}
+
+// handle{{.Name}}ClientStreamClose closes the client stream and receives final response
+func (pg *servicePlayground) handle{{.Name}}ClientStreamClose(w http.ResponseWriter, session *streamSession) {
+	// Get the stream from session
+	stream, ok := session.clientStream.({{.ServiceName}}_{{.Name}}Client)
+	if !ok {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+			Success: false,
+			Error:   "Invalid stream type",
+		})
+		return
+	}
+
+	// Close and receive final response
+	outputMsg, err := stream.CloseAndRecv()
 	if err != nil {
 		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Subscribe error: %v", err),
-		})
-		return
-	}
-	defer sub.Unsubscribe()
-
-	// Send all buffered messages to the base topic
-	for _, msgData := range session.messages {
-		// Unmarshal and remarshal to proto
-		inputMsg := &{{.InputTypeName}}{}
-		if err := protojson.Unmarshal(msgData, inputMsg); err != nil {
-			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
-				Success: false,
-				Error:   fmt.Sprintf("Invalid payload: %v", err),
-			})
-			return
-		}
-
-		data, err := proto.Marshal(inputMsg)
-		if err != nil {
-			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
-				Success: false,
-				Error:   fmt.Sprintf("Marshal error: %v", err),
-			})
-			return
-		}
-
-		msg := &nats.Msg{
-			Subject: subject,
-			Reply:   inbox,
-			Data:    data,
-			Header:  make(nats.Header),
-		}
-		msg.Header.Set("Stream-ID", session.streamID)
-
-		if err := pg.nc.PublishMsg(msg); err != nil {
-			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
-				Success: false,
-				Error:   fmt.Sprintf("Publish error: %v", err),
-			})
-			return
-		}
-	}
-
-	// Send close signal
-	closeMsg := &nats.Msg{
-		Subject: "{{.Topic}}.close",
-		Reply:   inbox,
-		Data:    []byte{},
-		Header:  make(nats.Header),
-	}
-	closeMsg.Header.Set("Stream-ID", session.streamID)
-
-	if err := pg.nc.PublishMsg(closeMsg); err != nil {
-		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Close error: %v", err),
+			Error:   err.Error(),
 		})
 		return
 	}
 
-	// Wait for final response
-	select {
-	case respMsg := <-responseCh:
-		if errMsg := respMsg.Header.Get("X-Error"); errMsg != "" {
-			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
-				Success: false,
-				Error:   errMsg,
-			})
-			return
-		}
-
-		outputMsg := &{{.OutputTypeName}}{}
-		if err := proto.Unmarshal(respMsg.Data, outputMsg); err != nil {
-			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
-				Success: false,
-				Error:   fmt.Sprintf("Unmarshal error: %v", err),
-			})
-			return
-		}
-
-		jsonData, err := protojson.Marshal(outputMsg)
-		if err != nil {
-			json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
-				Success: false,
-				Error:   fmt.Sprintf("JSON error: %v", err),
-			})
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
-			Success:  true,
-			Response: jsonData,
-		})
-
-	case <-time.After(30 * time.Second):
+	// Convert to JSON
+	jsonData, err := protojson.Marshal(outputMsg)
+	if err != nil {
 		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
 			Success: false,
-			Error:   "Timeout waiting for response",
+			Error:   fmt.Sprintf("JSON error: %v", err),
 		})
+		return
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+		Success:  true,
+		Response: jsonData,
+	})
+
+	// Signal cleanup
+	close(session.closeCh)
 }
 {{end}}
 {{end}}
@@ -717,14 +650,10 @@ func (pg *servicePlayground) handleBidiStream(w http.ResponseWriter, r *http.Req
 
 	// Create session
 	session := &streamSession{
-		streamID:   streamID,
-		method:     method,
-		inbox:      nats.NewInbox(),
-		messages:   make([]json.RawMessage, 0),
-		responseCh: make(chan json.RawMessage, 10),
-		errorCh:    make(chan string, 1),
-		closeCh:    make(chan struct{}),
-		createdAt:  time.Now(),
+		streamID:  streamID,
+		method:    method,
+		closeCh:   make(chan struct{}),
+		createdAt: time.Now(),
 	}
 
 	pg.mu.Lock()
@@ -755,70 +684,51 @@ func (pg *servicePlayground) handleBidiStream(w http.ResponseWriter, r *http.Req
 {{if isBidirectional .}}
 // handle{{.Name}}BidiStream handles bidirectional streaming for {{.Name}}
 func (pg *servicePlayground) handle{{.Name}}BidiStream(w http.ResponseWriter, r *http.Request, flusher http.Flusher, session *streamSession) {
-	// Subscribe to .out channel for responses
-	outSubject := "{{.Topic}}.out"
+	// Set timeout
+	timeout := 5 * time.Minute
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
 
-	sub, err := pg.nc.Subscribe(outSubject, func(msg *nats.Msg) {
-		// Check if this message is for our stream
-		if msg.Header.Get("Stream-ID") != session.streamID {
-			return
-		}
-
-		// Check for EOF
-		if msg.Header.Get("Stream-EOF") == "true" {
-			sendSSE(w, flusher, "close", "Stream completed")
-			close(session.closeCh)
-			return
-		}
-
-		// Check for error
-		if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
-			sendSSE(w, flusher, "error", errMsg)
-			return
-		}
-
-		// Unmarshal response
-		outputMsg := &{{.OutputTypeName}}{}
-		if err := proto.Unmarshal(msg.Data, outputMsg); err != nil {
-			sendSSE(w, flusher, "error", fmt.Sprintf("Unmarshal error: %v", err))
-			return
-		}
-
-		jsonData, err := protojson.Marshal(outputMsg)
-		if err != nil {
-			sendSSE(w, flusher, "error", fmt.Sprintf("JSON error: %v", err))
-			return
-		}
-
-		sendSSE(w, flusher, "message", string(jsonData))
-	})
-
+	// Create bidirectional stream using generated client
+	stream, err := pg.client.{{.Name}}(ctx)
 	if err != nil {
-		sendSSE(w, flusher, "error", fmt.Sprintf("Subscribe error: %v", err))
+		sendSSE(w, flusher, "error", fmt.Sprintf("Stream initiation error: %v", err))
 		return
 	}
-	defer sub.Unsubscribe()
+	defer stream.CloseSend()
 
-	session.sub = sub
-
-	// Send initialization message to start the server stream
-	initMsg := &nats.Msg{
-		Subject: "{{.Topic}}.init",
-		Data:    []byte{},
-		Header:  make(nats.Header),
-	}
-	initMsg.Header.Set("Stream-ID", session.streamID)
-
-	if err := pg.nc.PublishMsg(initMsg); err != nil {
-		sendSSE(w, flusher, "error", fmt.Sprintf("Init error: %v", err))
-		return
-	}
+	// Store stream in session
+	session.bidiStream = stream
 
 	// Send stream ID to client
 	sendSSE(w, flusher, "started", session.streamID)
 
+	// Start goroutine to receive messages from server
+	go func() {
+		for {
+			outputMsg, err := stream.Recv()
+			if err == io.EOF {
+				sendSSE(w, flusher, "close", "Stream completed")
+				close(session.closeCh)
+				return
+			}
+			if err != nil {
+				sendSSE(w, flusher, "error", err.Error())
+				close(session.closeCh)
+				return
+			}
+
+			jsonData, err := protojson.Marshal(outputMsg)
+			if err != nil {
+				sendSSE(w, flusher, "error", fmt.Sprintf("JSON error: %v", err))
+				continue
+			}
+
+			sendSSE(w, flusher, "message", string(jsonData))
+		}
+	}()
+
 	// Wait for close or timeout
-	timeout := 5 * time.Minute
 	select {
 	case <-session.closeCh:
 	case <-r.Context().Done():
@@ -876,6 +786,16 @@ func (pg *servicePlayground) handleBidiStreamSend(w http.ResponseWriter, r *http
 {{if isBidirectional .}}
 // handle{{.Name}}BidiStreamSend sends a message to the bidirectional stream
 func (pg *servicePlayground) handle{{.Name}}BidiStreamSend(w http.ResponseWriter, session *streamSession, payload json.RawMessage) {
+	// Get the stream from session
+	stream, ok := session.bidiStream.({{.ServiceName}}_{{.Name}}Client)
+	if !ok {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
+			Success: false,
+			Error:   "Invalid stream type",
+		})
+		return
+	}
+
 	// Unmarshal JSON to proto
 	inputMsg := &{{.InputTypeName}}{}
 	if err := protojson.Unmarshal(payload, inputMsg); err != nil {
@@ -886,27 +806,11 @@ func (pg *servicePlayground) handle{{.Name}}BidiStreamSend(w http.ResponseWriter
 		return
 	}
 
-	data, err := proto.Marshal(inputMsg)
-	if err != nil {
+	// Send message using generated client stream
+	if err := stream.Send(inputMsg); err != nil {
 		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Marshal error: %v", err),
-		})
-		return
-	}
-
-	// Send to .in channel
-	msg := &nats.Msg{
-		Subject: "{{.Topic}}.in",
-		Data:    data,
-		Header:  make(nats.Header),
-	}
-	msg.Header.Set("Stream-ID", session.streamID)
-
-	if err := pg.nc.PublishMsg(msg); err != nil {
-		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamSendResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Publish error: %v", err),
+			Error:   fmt.Sprintf("Send error: %v", err),
 		})
 		return
 	}
@@ -973,15 +877,18 @@ func (pg *servicePlayground) handleBidiStreamClose(w http.ResponseWriter, r *htt
 {{if isBidirectional .}}
 // handle{{.Name}}BidiStreamClose closes a bidirectional stream
 func (pg *servicePlayground) handle{{.Name}}BidiStreamClose(w http.ResponseWriter, session *streamSession) {
-	// Send close signal to .close channel
-	closeMsg := &nats.Msg{
-		Subject: "{{.Topic}}.close",
-		Data:    []byte{},
-		Header:  make(nats.Header),
+	// Get the stream from session
+	stream, ok := session.bidiStream.({{.ServiceName}}_{{.Name}}Client)
+	if !ok {
+		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
+			Success: false,
+			Error:   "Invalid stream type",
+		})
+		return
 	}
-	closeMsg.Header.Set("Stream-ID", session.streamID)
 
-	if err := pg.nc.PublishMsg(closeMsg); err != nil {
+	// Close the send side of the stream
+	if err := stream.CloseSend(); err != nil {
 		json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
 			Success: false,
 			Error:   fmt.Sprintf("Close error: %v", err),
@@ -989,12 +896,7 @@ func (pg *servicePlayground) handle{{.Name}}BidiStreamClose(w http.ResponseWrite
 		return
 	}
 
-	// Unsubscribe
-	if session.sub != nil {
-		session.sub.Unsubscribe()
-	}
-
-	// Close the channel to signal SSE handler
+	// Signal the SSE handler to stop
 	close(session.closeCh)
 
 	w.Header().Set("Content-Type", "application/json")
