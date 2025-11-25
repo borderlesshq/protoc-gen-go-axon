@@ -503,7 +503,7 @@ func (pg *servicePlayground) handle{{.Name}}ClientStreamInit(w http.ResponseWrit
 	// Don't cancel immediately - store it in session for later cleanup
 
 	// Create client stream using generated client
-	stream, err := pg.client.{{.Name}}(ctx, nil)
+	stream, err := pg.client.{{.Name}}(ctx)
 	if err != nil {
 		cancel()
 		json.NewEncoder(w).Encode(&{{.ServiceName}}ClientStreamInitResponse{

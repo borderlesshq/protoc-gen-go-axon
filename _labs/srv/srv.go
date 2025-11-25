@@ -91,6 +91,14 @@ func (c CustomAccountsService) ListAccounts(ctx context.Context, request *accoun
 func (c CustomAccountsService) StreamWalletUpdates(server accounts.AccountService_StreamWalletUpdatesServer) error {
 	list := FakeWallets(2000)
 	for _, w := range list {
+		go func() {
+			out, err := server.Recv()
+			if err != nil {
+				fmt.Println("error receiving from client: ", err)
+				return
+			}
+			fmt.Println("received from client in bidi: ", out)
+		}()
 		if err := server.Send(w); err != nil {
 			return err
 		}

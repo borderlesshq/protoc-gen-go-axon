@@ -442,12 +442,14 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 	// Handle cleanup on context cancellation
 	go func() {
 		<-ctx.Done()
-		sub.Unsubscribe()
-		if tracingEnabled && span.IsRecording() {
-			span.SetStatus(codes.Error, "context cancelled")
-			span.End()
-		}
-		close(recvCh)
+		stream.closeOnce.Do(func() {
+			sub.Unsubscribe()
+			if tracingEnabled && span.IsRecording() {
+				span.SetStatus(codes.Error, "context cancelled")
+				span.End()
+			}
+			close(recvCh)
+		})
 	}()
 
 	return stream, nil
@@ -471,7 +473,7 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 
 	streamID := nats.NewInbox()
 	responseInbox := streamID + ".response"
-	
+
 	// Subscribe for final response
 	responseSub, err := c.nc.SubscribeSync(responseInbox)
 	if err != nil {
@@ -481,6 +483,26 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 			span.End()
 		}
 		return nil, fmt.Errorf("failed to subscribe to response: %w", err)
+	}
+
+	// Notify server of stream initialization
+	header := nats.Header{}
+	header.Set("Stream-ID", streamID)
+
+	// Inject trace context
+	injectTraceContext(ctx, header)
+
+	if err := c.nc.PublishMsg(&nats.Msg{
+		Subject: "{{.Topic}}.init",
+		Header:  header,
+	}); err != nil {
+		responseSub.Unsubscribe()
+		if tracingEnabled {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to initialize stream")
+			span.End()
+		}
+		return nil, fmt.Errorf("failed to initialize stream: %w", err)
 	}
 
 	return &{{streamImplType .ServiceName .Name "Client"}}{
@@ -564,12 +586,14 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, opts ...Cal
 	// Handle cleanup on context cancellation
 	go func() {
 		<-ctx.Done()
-		sub.Unsubscribe()
-		if tracingEnabled && span.IsRecording() {
-			span.SetStatus(codes.Error, "context cancelled")
-			span.End()
-		}
-		close(recvCh)
+		stream.closeOnce.Do(func() {
+			sub.Unsubscribe()
+			if tracingEnabled && span.IsRecording() {
+				span.SetStatus(codes.Error, "context cancelled")
+				span.End()
+			}
+			close(recvCh)
+		})
 	}()
 
 	return stream, nil
@@ -698,46 +722,19 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 	}
 {{else if isClientStreaming .}}
 	// {{.Name}} - Client streaming RPC
-	streamAggregator := &{{.ServiceName}}_{{.Name}}_Aggregator{
+	{{.Name}}_streamManager := &{{.ServiceName}}_{{.Name}}_Manager{
 		nc:      nc,
 		srv:     srv,
-		streams: make(map[string]*{{.ServiceName}}_{{.Name}}_StreamBuffer),
+		streams: make(map[string]*{{.ServiceName}}_{{.Name}}_StreamHandler),
 	}
 
-	// Subscribe to data messages with queue group
-	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+	// Subscribe to init signal to start new streams with queue group
+	if _, err := nc.QueueSubscribe("{{.Topic}}.init", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
 
-		streamAggregator.mu.Lock()
-		buf, exists := streamAggregator.streams[streamID]
-		if !exists {
-			buf = &{{.ServiceName}}_{{.Name}}_StreamBuffer{
-				messages:  make([]{{.InputType}}, 0),
-				responseSubject: streamID + ".response",
-			}
-			streamAggregator.streams[streamID] = buf
-		}
-		streamAggregator.mu.Unlock()
-
-		in := &{{.InputTypeName}}{}
-		if err := proto.Unmarshal(msg.Data, in); err != nil {
-			return
-		}
-		
-		buf.mu.Lock()
-		buf.messages = append(buf.messages, in)
-		buf.mu.Unlock()
-	}); err != nil {
-		return err
-	}
-
-	// Subscribe to close signal with queue group
-	if _, err := nc.QueueSubscribe("{{.Topic}}.close", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
-		streamID := msg.Header.Get("Stream-ID")
-		
 		// Extract trace context
 		ctx := extractTraceContext(context.Background(), msg.Header)
-		
+
 		// Start server span
 		ctx, span := startSpan(ctx, "{{.ServiceName}}.{{.Name}}",
 			trace.SpanKindServer,
@@ -746,54 +743,116 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 			attribute.String("rpc.method", "{{.Name}}"),
 			attribute.String("stream.type", "client"),
 		)
-		defer span.End()
 
-		streamAggregator.mu.Lock()
-		buf := streamAggregator.streams[streamID]
-		delete(streamAggregator.streams, streamID)
-		streamAggregator.mu.Unlock()
-		
-		if buf == nil {
+		// Check if stream already exists (reconnection scenario)
+		{{.Name}}_streamManager.mu.Lock()
+		existingStream := {{.Name}}_streamManager.streams[streamID]
+		if existingStream != nil {
+			{{.Name}}_streamManager.mu.Unlock()
 			return
 		}
 
-		if tracingEnabled {
-			span.SetAttributes(attribute.Int("stream.messages_received", len(buf.messages)))
+		handler := &{{.ServiceName}}_{{.Name}}_StreamHandler{
+			recvCh:          make(chan {{.InputType}}, 10),
+			responseSubject: streamID + ".response",
+			nc:              nc,
+			streamID:        streamID,
+			closeCh:         make(chan struct{}),
 		}
+
+		{{.Name}}_streamManager.streams[streamID] = handler
+		{{.Name}}_streamManager.mu.Unlock()
 
 		stream := &{{streamImplType .ServiceName .Name "Server"}}{
-			messages: buf.messages,
-			index:    0,
+			handler: handler,
 		}
 
-		if err := srv.{{.Name}}(stream); err != nil {
-			if tracingEnabled {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
+		go func() {
+			defer span.End()
+
+			if err := srv.{{.Name}}(stream); err != nil {
+				if tracingEnabled {
+					span.RecordError(err)
+					span.SetStatus(codes.Error, err.Error())
+				}
+				errHeader := nats.Header{}
+				errHeader.Set("X-Error", err.Error())
+				nc.PublishMsg(&nats.Msg{
+					Subject: handler.responseSubject,
+					Header:  errHeader,
+				})
+				return
 			}
-			errHeader := nats.Header{}
-			errHeader.Set("X-Error", err.Error())
-			nc.PublishMsg(&nats.Msg{
-				Subject: buf.responseSubject,
-				Header:  errHeader,
-			})
+
+			if tracingEnabled {
+				span.SetStatus(codes.Ok, "")
+			}
+
+			if stream.response != nil {
+				data, _ := proto.Marshal(stream.response)
+				nc.Publish(handler.responseSubject, data)
+			}
+
+			// Cleanup
+			{{.Name}}_streamManager.mu.Lock()
+			delete({{.Name}}_streamManager.streams, streamID)
+			{{.Name}}_streamManager.mu.Unlock()
+		}()
+	}); err != nil {
+		return err
+	}
+
+	// Subscribe to data messages with queue group
+	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		streamID := msg.Header.Get("Stream-ID")
+
+		{{.Name}}_streamManager.mu.RLock()
+		handler, exists := {{.Name}}_streamManager.streams[streamID]
+		{{.Name}}_streamManager.mu.RUnlock()
+
+		if !exists {
 			return
 		}
 
-		if tracingEnabled {
-			span.SetStatus(codes.Ok, "")
+		in := &{{.InputTypeName}}{}
+		if err := proto.Unmarshal(msg.Data, in); err != nil {
+			return
 		}
 
-		if stream.response != nil {
-			data, _ := proto.Marshal(stream.response)
-			nc.Publish(buf.responseSubject, data)
+		// Send message to channel (non-blocking to avoid deadlock)
+		select {
+		case handler.recvCh <- in:
+		case <-handler.closeCh:
+			// Stream already closed
+			return
+		default:
+			// Channel full, drop message or handle error
 		}
+	}); err != nil {
+		return err
+	}
+
+	// Subscribe to close signal with queue group
+	if _, err := nc.QueueSubscribe("{{.Topic}}.close", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		streamID := msg.Header.Get("Stream-ID")
+
+		{{.Name}}_streamManager.mu.RLock()
+		handler, exists := {{.Name}}_streamManager.streams[streamID]
+		{{.Name}}_streamManager.mu.RUnlock()
+
+		if !exists {
+			return
+		}
+
+		// Close the receive channel to signal EOF
+		close(handler.recvCh)
+		close(handler.closeCh)
 	}); err != nil {
 		return err
 	}
 {{else}}
 	// {{.Name}} - Bidirectional streaming RPC
-	streamManager := &{{.ServiceName}}_{{.Name}}_Manager{
+	{{.Name}}_streamManager := &{{.ServiceName}}_{{.Name}}_Manager{
 		nc:      nc,
 		srv:     srv,
 		streams: make(map[string]*{{.ServiceName}}_{{.Name}}_ServerStream),
@@ -816,10 +875,10 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 		)
 
 		// Check if stream already exists (reconnection scenario)
-		streamManager.mu.Lock()
-		existingStream := streamManager.streams[streamID]
+		{{.Name}}_streamManager.mu.Lock()
+		existingStream := {{.Name}}_streamManager.streams[streamID]
 		if existingStream != nil {
-			streamManager.mu.Unlock()
+			{{.Name}}_streamManager.mu.Unlock()
 			return
 		}
 
@@ -830,8 +889,8 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 			sendSubject: streamID + ".out",
 		}
 
-		streamManager.streams[streamID] = stream
-		streamManager.mu.Unlock()
+		{{.Name}}_streamManager.streams[streamID] = stream
+		{{.Name}}_streamManager.mu.Unlock()
 
 		go func() {
 			defer span.End()
@@ -862,11 +921,11 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 	// Subscribe to data with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}.in", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
-		
-		streamManager.mu.RLock()
-		stream := streamManager.streams[streamID]
-		streamManager.mu.RUnlock()
-		
+
+		{{.Name}}_streamManager.mu.RLock()
+		stream := {{.Name}}_streamManager.streams[streamID]
+		{{.Name}}_streamManager.mu.RUnlock()
+
 		if stream == nil {
 			return
 		}
@@ -887,12 +946,12 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 	// Subscribe to close with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}.close", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
 		streamID := msg.Header.Get("Stream-ID")
-		
-		streamManager.mu.Lock()
-		stream := streamManager.streams[streamID]
-		delete(streamManager.streams, streamID)
-		streamManager.mu.Unlock()
-		
+
+		{{.Name}}_streamManager.mu.Lock()
+		stream := {{.Name}}_streamManager.streams[streamID]
+		delete({{.Name}}_streamManager.streams, streamID)
+		{{.Name}}_streamManager.mu.Unlock()
+
 		if stream != nil {
 			close(stream.recvCh)
 		}
@@ -965,6 +1024,7 @@ type {{streamImplType .ServiceName .Name "Client"}} struct {
 	topic            string
 	lastActivityNano int64 // atomic access only
 	stopMonitor      chan struct{}
+	closeOnce        sync.Once
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) Recv() ({{.OutputType}}, error) {
@@ -1087,7 +1147,9 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg
 			s.span.SetStatus(codes.Ok, "")
 			s.span.End()
 		}
-		close(s.recvCh)
+		s.closeOnce.Do(func() {
+			close(s.recvCh)
+		})
 		return
 	}
 
@@ -1103,7 +1165,9 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg
 		case s.errCh <- err:
 		default:
 		}
-		close(s.recvCh)
+		s.closeOnce.Do(func() {
+			close(s.recvCh)
+		})
 		return
 	}
 
@@ -1246,22 +1310,16 @@ type {{streamType .ServiceName .Name "Server"}} interface {
 }
 
 type {{streamImplType .ServiceName .Name "Server"}} struct {
-	messages []{{.InputType}}
-	index    int
+	handler  *{{.ServiceName}}_{{.Name}}_StreamHandler
 	response {{.OutputType}}
 	mu       sync.Mutex
 }
 
 func (s *{{streamImplType .ServiceName .Name "Server"}}) Recv() ({{.InputType}}, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.index >= len(s.messages) {
+	msg, ok := <-s.handler.recvCh
+	if !ok {
 		return nil, io.EOF
 	}
-
-	msg := s.messages[s.index]
-	s.index++
 	return msg, nil
 }
 
@@ -1273,18 +1331,20 @@ func (s *{{streamImplType .ServiceName .Name "Server"}}) SendAndClose(msg {{.Out
 	return nil
 }
 
-// Aggregator for client streaming
-type {{.ServiceName}}_{{.Name}}_Aggregator struct {
+// Manager for client streaming
+type {{.ServiceName}}_{{.Name}}_Manager struct {
 	nc      *nats.Conn
 	srv     {{.ServiceName}}Server
-	streams map[string]*{{.ServiceName}}_{{.Name}}_StreamBuffer
+	streams map[string]*{{.ServiceName}}_{{.Name}}_StreamHandler
 	mu      sync.RWMutex
 }
 
-type {{.ServiceName}}_{{.Name}}_StreamBuffer struct {
-	messages        []{{.InputType}}
+type {{.ServiceName}}_{{.Name}}_StreamHandler struct {
+	recvCh          chan {{.InputType}}
 	responseSubject string
-	mu              sync.Mutex
+	nc              *nats.Conn
+	streamID        string
+	closeCh         chan struct{}
 }
 `))
 
@@ -1311,6 +1371,7 @@ type {{streamImplType .ServiceName .Name "Client"}} struct {
 	reconnecting     bool
 	lastActivityNano int64 // atomic access only
 	stopMonitor      chan struct{}
+	closeOnce        sync.Once
 }
 
 func (s *{{streamImplType .ServiceName .Name "Client"}}) Send(msg {{.InputType}}) error {
@@ -1379,7 +1440,12 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseSend() error {
 	}
 
 	s.sub.Unsubscribe()
-	close(s.recvCh)
+
+	// Use sync.Once to ensure channel is only closed once
+	s.closeOnce.Do(func() {
+		close(s.recvCh)
+	})
+
 	return nil
 }
 
@@ -1467,7 +1533,9 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleRecvMessage(msg *
 			s.span.SetStatus(codes.Ok, "")
 			s.span.End()
 		}
-		close(s.recvCh)
+		s.closeOnce.Do(func() {
+			close(s.recvCh)
+		})
 		return
 	}
 
@@ -1483,7 +1551,9 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleRecvMessage(msg *
 		case s.errCh <- err:
 		default:
 		}
-		close(s.recvCh)
+		s.closeOnce.Do(func() {
+			close(s.recvCh)
+		})
 		return
 	}
 
