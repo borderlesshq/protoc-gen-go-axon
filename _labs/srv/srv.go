@@ -11,6 +11,28 @@ import (
 type CustomAccountsService struct {
 }
 
+func (c CustomAccountsService) StreamWalletUpdatesFromServer(request *accounts.GetByIdRequest, server accounts.AccountService_StreamWalletUpdatesFromServerServer) error {
+	list := FakeWallets(2000)
+	for _, w := range list {
+		if err := server.Send(w); err != nil {
+			return err
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return nil
+}
+
+func (c CustomAccountsService) StreamWalletUpdatesFromClient(server accounts.AccountService_StreamWalletUpdatesFromClientServer) error {
+	for {
+		in, err := server.Recv()
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(in.Id)
+	}
+}
+
 func (c CustomAccountsService) CreateWallet(ctx context.Context, req *accounts.CreateWalletRequest) (*accounts.Wallet, error) {
 	wallet := &accounts.Wallet{
 		Id:       fmt.Sprintf("wlt_%d", time.Now().Unix()),
@@ -69,6 +91,14 @@ func (c CustomAccountsService) ListAccounts(ctx context.Context, request *accoun
 func (c CustomAccountsService) StreamWalletUpdates(server accounts.AccountService_StreamWalletUpdatesServer) error {
 	list := FakeWallets(2000)
 	for _, w := range list {
+		go func() {
+			out, err := server.Recv()
+			if err != nil {
+				fmt.Println("error receiving from client: ", err)
+				return
+			}
+			fmt.Println("received from client in bidi: ", out)
+		}()
 		if err := server.Send(w); err != nil {
 			return err
 		}
