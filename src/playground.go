@@ -21,8 +21,14 @@ type streamSession struct {
 	clientStream interface{}  // Stores the generated client stream object
 	bidiStream  interface{}   // Stores bidirectional stream object
 	closeCh     chan struct{}
+	closeOnce   sync.Once     // closeCh is closed by whichever of the close handler and the receive loop finishes first
 	sub         *nats.Subscription
 	createdAt   time.Time
+}
+
+// close signals the session's handlers to stop. Safe to call more than once.
+func (s *streamSession) close() {
+	s.closeOnce.Do(func() { close(s.closeCh) })
 }
 
 // servicePlayground provides a web interface for testing {{.Name}} methods
@@ -618,7 +624,7 @@ func (pg *servicePlayground) handle{{.Name}}ClientStreamClose(w http.ResponseWri
 	})
 
 	// Signal cleanup
-	close(session.closeCh)
+	session.close()
 }
 {{end}}
 {{end}}
@@ -697,34 +703,51 @@ func (pg *servicePlayground) handle{{.Name}}BidiStream(w http.ResponseWriter, r 
 	}
 	defer stream.CloseSend()
 
+	// The receive goroutine and this handler both write to w. Serialise the writes and
+	// stop them once the handler returns: a ResponseWriter must not be used after that.
+	var wmu sync.Mutex
+	ended := false
+	emit := func(event, data string) {
+		wmu.Lock()
+		defer wmu.Unlock()
+		if !ended {
+			sendSSE(w, flusher, event, data)
+		}
+	}
+	defer func() {
+		wmu.Lock()
+		ended = true
+		wmu.Unlock()
+	}()
+
 	// Store stream in session
 	session.bidiStream = stream
 
 	// Send stream ID to client
-	sendSSE(w, flusher, "started", session.streamID)
+	emit("started", session.streamID)
 
 	// Start goroutine to receive messages from server
 	go func() {
 		for {
 			outputMsg, err := stream.Recv()
 			if err == io.EOF {
-				sendSSE(w, flusher, "close", "Stream completed")
-				close(session.closeCh)
+				emit("close", "Stream completed")
+				session.close()
 				return
 			}
 			if err != nil {
-				sendSSE(w, flusher, "error", err.Error())
-				close(session.closeCh)
+				emit("error", err.Error())
+				session.close()
 				return
 			}
 
 			jsonData, err := protojson.Marshal(outputMsg)
 			if err != nil {
-				sendSSE(w, flusher, "error", fmt.Sprintf("JSON error: %v", err))
+				emit("error", fmt.Sprintf("JSON error: %v", err))
 				continue
 			}
 
-			sendSSE(w, flusher, "message", string(jsonData))
+			emit("message", string(jsonData))
 		}
 	}()
 
@@ -733,7 +756,7 @@ func (pg *servicePlayground) handle{{.Name}}BidiStream(w http.ResponseWriter, r 
 	case <-session.closeCh:
 	case <-r.Context().Done():
 	case <-time.After(timeout):
-		sendSSE(w, flusher, "error", "Timeout")
+		emit("error", "Timeout")
 	}
 }
 {{end}}
@@ -897,7 +920,7 @@ func (pg *servicePlayground) handle{{.Name}}BidiStreamClose(w http.ResponseWrite
 	}
 
 	// Signal the SSE handler to stop
-	close(session.closeCh)
+	session.close()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(&{{.ServiceName}}StreamCloseResponse{
