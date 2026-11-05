@@ -78,11 +78,15 @@ func generateFile(gen *protogen.Plugin, file *protogen.File) {
 		log.Fatalf("Failed to execute template: %v", err)
 	}
 
-	// Format the generated code
-	formatted, err := format.Source(buf.Bytes())
+	// Drop the template's unused imports and format, so the file compiles as written
+	// and consumers need no goimports pass afterwards.
+	formatted, err := pruneImports(buf.Bytes())
 	if err != nil {
-		log.Printf("Failed to format generated code: %v", err)
-		formatted = buf.Bytes()
+		log.Printf("Failed to prune imports in generated code: %v", err)
+		if formatted, err = format.Source(buf.Bytes()); err != nil {
+			log.Printf("Failed to format generated code: %v", err)
+			formatted = buf.Bytes()
+		}
 	}
 
 	g.P(string(formatted))

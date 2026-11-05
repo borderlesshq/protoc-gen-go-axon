@@ -57,7 +57,7 @@ make vet
    - Uses `protogen` to parse `.proto` files
    - Extracts services and methods
    - Passes data to template engine
-   - Formats and outputs generated code to `*_axon.pb.go` files
+   - Prunes the template's unused imports (`imports.go`) and gofmts, so generated `*_axon.pb.go` files compile as written with no `goimports` pass
 
 2. **Template System** (`src/` directory):
    - `src.go`: Main template orchestrator with helper functions
