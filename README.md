@@ -21,6 +21,7 @@ A Protocol Buffers compiler plugin that generates gRPC-style RPC code over NATS 
 - [Makefile Usage](#makefile-usage)
 - [Generated Code](#generated-code)
 - [Usage Examples](#usage-examples)
+- [Errors](#errors)
 - [Architecture](#architecture)
 - [Advanced Topics](#advanced-topics)
 - [Contributing](#contributing)
@@ -632,6 +633,35 @@ for {
     log.Printf("Received: %s", msg.Text)
 }
 ```
+
+## Errors
+
+Every failed client call returns a `*RPCError` (generated into each contracts package). Read it with `errors.As`:
+
+```go
+_, err := client.GetWallet(ctx, req)
+var rpcErr *accounts.RPCError
+if errors.As(err, &rpcErr) {
+    switch rpcErr.Code {
+    case "NOT_FOUND":
+        // rpcErr.Message is safe to show; rpcErr.Details is the JSON the service attached
+    case accounts.ErrorCodeUpstreamUnavailable: // never delivered: safe to retry
+    case accounts.ErrorCodeUpstreamTimeout:     // no answer in time: may have run
+    }
+}
+```
+
+`err.Error()` is unchanged from earlier versions (`server error: <full text>` or `request failed: <nats error>`), and the NATS or context cause is kept for `errors.Is` (`nats.ErrNoResponders`, `context.DeadlineExceeded`).
+
+**Giving errors a code.** A handler error becomes structured when it implements `RPCCode() string`. It may also implement `RPCMessage() string` (the message for people, without internal causes), `RPCService() string` and `RPCDetails() any` (sent as JSON). An `*RPCError` from a downstream call implements all four, so returning it passes its code on to the next caller. Errors without a code arrive as `UNKNOWN` with their text as the message.
+
+**On the wire** the reply carries `X-Error-Code`, `X-Error-Message`, `X-Error-Service` and `X-Error-Details`, plus `X-Error` with the full error text as older clients read it. Clients also parse `[CODE] [service] message` out of an `X-Error`-only reply from an older server.
+
+**Codes axon produces itself:** `INTERNAL_ERROR` (handler panic, unencodable response), `INVALID_PARAMETERS` (undecodable request), `UPSTREAM_UNAVAILABLE` (nobody listening / no connection), `UPSTREAM_TIMEOUT` (deadline or NATS timeout), `UNKNOWN` (uncoded error).
+
+**Panics.** Every handler recovers: the call is answered with `INTERNAL_ERROR` and the service keeps running. Panics are reported to the package's `PanicHandler(method, recovered, stack)`, which logs by default; replace it to use your logger.
+
+**Streams.** Returning `io.EOF` from a server or bidirectional streaming handler ends the stream normally. A client streaming handler that returns without calling `SendAndClose` answers `INTERNAL_ERROR` instead of leaving the caller to time out. Stream errors reach `Recv()` / `CloseAndRecv()` as `*RPCError`.
 
 ## Architecture
 

@@ -105,10 +105,14 @@ package {{.PackageName}}
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"reflect"
+	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -216,6 +220,174 @@ func WithHeader(key, value string) CallOption {
 }
 
 
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+// Error codes axon itself produces. Services choose their own codes; these match the
+// usual set (NOT_FOUND, VALIDATION_FAILED, ...) so callers can treat them alike.
+const (
+	// ErrorCodeUnknown: the service returned an error that carries no code.
+	ErrorCodeUnknown = "UNKNOWN"
+	// ErrorCodeInternal: the handler panicked, or its response could not be encoded.
+	ErrorCodeInternal = "INTERNAL_ERROR"
+	// ErrorCodeInvalidParameters: the request could not be decoded.
+	ErrorCodeInvalidParameters = "INVALID_PARAMETERS"
+	// ErrorCodeUpstreamUnavailable: no service was listening, or there was no connection.
+	// The request was never delivered.
+	ErrorCodeUpstreamUnavailable = "UPSTREAM_UNAVAILABLE"
+	// ErrorCodeUpstreamTimeout: no answer in time. The request may or may not have run.
+	ErrorCodeUpstreamTimeout = "UPSTREAM_TIMEOUT"
+)
+
+// RPCError is returned by every client call that fails: when the service answered with an
+// error, and when the request could not be delivered or answered at all. Read it with
+// errors.As. The transport cause, if any, is kept for errors.Is (nats.ErrNoResponders,
+// nats.ErrTimeout, context.DeadlineExceeded).
+//
+// On the wire it travels as headers: X-Error-Code, X-Error-Message, X-Error-Service and
+// X-Error-Details (JSON), plus X-Error with the error's full text as older clients read it.
+//
+// A service's error becomes structured when it implements RPCCode() string; it may also
+// implement RPCMessage() string (the message without internal causes), RPCService()
+// string and RPCDetails() any (JSON-encoded).
+type RPCError struct {
+	// Code is the machine-readable code, e.g. NOT_FOUND.
+	Code string
+	// Message is meant for people: the service's message without internal causes.
+	Message string
+	// Service is the service that produced the error, when it said.
+	Service string
+	// Details is the JSON the service attached, or nil.
+	Details json.RawMessage
+
+	text  string // full text, as Error() reports it
+	cause error
+}
+
+func (e *RPCError) Error() string { return e.text }
+func (e *RPCError) Unwrap() error { return e.cause }
+
+// RPCCode, RPCMessage, RPCService and RPCDetails let an RPCError returned by a downstream
+// call be returned again as is: it keeps its code across the next hop.
+func (e *RPCError) RPCCode() string    { return e.Code }
+func (e *RPCError) RPCMessage() string { return e.Message }
+func (e *RPCError) RPCService() string { return e.Service }
+func (e *RPCError) RPCDetails() any {
+	if len(e.Details) == 0 {
+		return nil
+	}
+	return e.Details
+}
+
+// PanicHandler is told about every handler panic: the method, the recovered value and
+// the stack. The call is answered with INTERNAL_ERROR and the service keeps running.
+// Replace it to send panics to your own logger.
+var PanicHandler = func(method string, recovered any, stack []byte) {
+	log.Printf("axon: panic in %s: %v\n%s", method, recovered, stack)
+}
+
+// recoverHandler is deferred by every handler. It must be the deferred function itself
+// so recover() sees the panic.
+func recoverHandler(method string, respond func(nats.Header)) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+	if PanicHandler != nil {
+		PanicHandler(method, recovered, debug.Stack())
+	}
+	if respond != nil {
+		respond(errorHeader(newError(ErrorCodeInternal, "internal error")))
+	}
+}
+
+func newError(code, message string) *RPCError {
+	return &RPCError{Code: code, Message: message, text: "[" + code + "] " + message}
+}
+
+// errorHeader encodes a handler's error for the reply.
+func errorHeader(err error) nats.Header {
+	h := nats.Header{}
+	h.Set("X-Error", err.Error())
+
+	var coded interface{ RPCCode() string }
+	if !errors.As(err, &coded) || coded.RPCCode() == "" {
+		h.Set("X-Error-Code", ErrorCodeUnknown)
+		h.Set("X-Error-Message", err.Error())
+		return h
+	}
+
+	h.Set("X-Error-Code", coded.RPCCode())
+	h.Set("X-Error-Message", err.Error())
+	if m, ok := coded.(interface{ RPCMessage() string }); ok {
+		h.Set("X-Error-Message", m.RPCMessage())
+	}
+	if s, ok := coded.(interface{ RPCService() string }); ok && s.RPCService() != "" {
+		h.Set("X-Error-Service", s.RPCService())
+	}
+	if d, ok := coded.(interface{ RPCDetails() any }); ok {
+		if v := d.RPCDetails(); v != nil {
+			if b, err := json.Marshal(v); err == nil && string(b) != "null" {
+				h.Set("X-Error-Details", string(b))
+			}
+		}
+	}
+	return h
+}
+
+// legacyErrorPattern reads the code, service and message out of an errortools-style
+// "[CODE] [service] message" text sent by a server older than structured headers.
+var legacyErrorPattern = regexp.MustCompile(` + "`" + `^\[([A-Z_]+)\](?: \[([^\]]+)\])? (.*)$` + "`" + `)
+
+// errorFromHeader decodes a failed reply, or returns nil when the reply is not an error.
+func errorFromHeader(h nats.Header) *RPCError {
+	text := h.Get("X-Error")
+	code := h.Get("X-Error-Code")
+	if text == "" && code == "" {
+		return nil
+	}
+	if text == "" {
+		text = "[" + code + "] " + h.Get("X-Error-Message")
+	}
+
+	e := &RPCError{
+		Code:    code,
+		Message: h.Get("X-Error-Message"),
+		Service: h.Get("X-Error-Service"),
+		text:    "server error: " + text,
+	}
+	if d := h.Get("X-Error-Details"); d != "" {
+		e.Details = json.RawMessage(d)
+	}
+	if e.Code == "" {
+		e.Code, e.Message = ErrorCodeUnknown, text
+		if m := legacyErrorPattern.FindStringSubmatch(text); m != nil {
+			e.Code, e.Service, e.Message = m[1], m[2], m[3]
+		}
+	}
+	return e
+}
+
+// transportError describes a request that got no answer from a service. The text is
+// what callers have always seen ("request failed: ..."); the code says what it means.
+func transportError(prefix string, err error) error {
+	code := ""
+	message := ""
+	switch {
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%s: %w", prefix, err)
+	case errors.Is(err, nats.ErrNoResponders), errors.Is(err, nats.ErrNoServers),
+		errors.Is(err, nats.ErrInvalidConnection), errors.Is(err, nats.ErrConnectionClosed):
+		code, message = ErrorCodeUpstreamUnavailable, "the service is not available"
+	case errors.Is(err, nats.ErrTimeout), errors.Is(err, context.DeadlineExceeded):
+		code, message = ErrorCodeUpstreamTimeout, "the service did not answer in time"
+	default:
+		return fmt.Errorf("%s: %w", prefix, err)
+	}
+	return &RPCError{Code: code, Message: message, text: prefix + ": " + err.Error(), cause: err}
+}
 
 {{template "serviceRegistry" .}}
 

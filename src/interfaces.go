@@ -121,7 +121,7 @@ func _register{{.Name}}StreamHandlers(nc *nats.Conn, srv {{.Name}}Server) error 
 func _{{.ServiceName}}_{{.Name}}_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor UnaryServerInterceptor) (interface{}, error) {
 	in := &{{.InputTypeName}}{}
 	if err := dec(in); err != nil {
-		return nil, err
+		return nil, newError(ErrorCodeInvalidParameters, fmt.Sprintf("failed to unmarshal request: %v", err))
 	}
 	
 	if interceptor == nil {
@@ -327,17 +327,16 @@ func (c *{{clientType .ServiceName}}) {{.Name}}Invoke(ctx context.Context, in {{
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 		}
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, transportError("request failed", err)
 	}
 
 	// Check for error in response headers
-	if errMsg := resp.Header.Get("X-Error"); errMsg != "" {
-		err := fmt.Errorf("server error: %s", errMsg)
+	if rpcErr := errorFromHeader(resp.Header); rpcErr != nil {
 		if tracingEnabled {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, errMsg)
+			span.RecordError(rpcErr)
+			span.SetStatus(codes.Error, rpcErr.Code)
 		}
-		return nil, err
+		return nil, rpcErr
 	}
 
 	out := &{{.OutputTypeName}}{}
@@ -606,6 +605,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 {{if isUnary .}}
 	// {{.Name}} - Unary RPC
 	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		defer recoverHandler("{{.ServiceName}}.{{.Name}}", func(h nats.Header) { msg.RespondMsg(&nats.Msg{Header: h}) })
 		// Extract trace context from headers if tracing is enabled
 		ctx := extractTraceContext(context.Background(), msg.Header)
 		
@@ -624,9 +624,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 				span.RecordError(err)
 				span.SetStatus(codes.Error, "failed to unmarshal request")
 			}
-			errHeader := nats.Header{}
-			errHeader.Set("X-Error", fmt.Sprintf("failed to unmarshal request: %v", err))
-			msg.RespondMsg(&nats.Msg{Header: errHeader})
+			msg.RespondMsg(&nats.Msg{Header: errorHeader(newError(ErrorCodeInvalidParameters, fmt.Sprintf("failed to unmarshal request: %v", err)))})
 			return
 		}
 
@@ -636,9 +634,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 				span.RecordError(err)
 				span.SetStatus(codes.Error, err.Error())
 			}
-			errHeader := nats.Header{}
-			errHeader.Set("X-Error", err.Error())
-			msg.RespondMsg(&nats.Msg{Header: errHeader})
+			msg.RespondMsg(&nats.Msg{Header: errorHeader(err)})
 			return
 		}
 
@@ -648,9 +644,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 				span.RecordError(err)
 				span.SetStatus(codes.Error, "failed to marshal response")
 			}
-			errHeader := nats.Header{}
-			errHeader.Set("X-Error", fmt.Sprintf("failed to marshal response: %v", err))
-			msg.RespondMsg(&nats.Msg{Header: errHeader})
+			msg.RespondMsg(&nats.Msg{Header: errorHeader(newError(ErrorCodeInternal, fmt.Sprintf("failed to marshal response: %v", err)))})
 			return
 		}
 
@@ -664,6 +658,10 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 {{else if isServerStreaming .}}
 	// {{.Name}} - Server streaming RPC
 	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		defer recoverHandler("{{.ServiceName}}.{{.Name}}", func(h nats.Header) {
+			h.Set("Stream-EOF", "true")
+			nc.PublishMsg(&nats.Msg{Subject: msg.Reply, Header: h})
+		})
 		// Extract trace context
 		ctx := extractTraceContext(context.Background(), msg.Header)
 
@@ -683,8 +681,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 				span.RecordError(err)
 				span.SetStatus(codes.Error, "failed to unmarshal request")
 			}
-			errHeader := nats.Header{}
-			errHeader.Set("X-Error", fmt.Sprintf("failed to unmarshal request: %v", err))
+			errHeader := errorHeader(newError(ErrorCodeInvalidParameters, fmt.Sprintf("failed to unmarshal request: %v", err)))
 			errHeader.Set("Stream-EOF", "true")
 			nc.PublishMsg(&nats.Msg{
 				Subject: msg.Reply,
@@ -698,13 +695,13 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 			reply:  msg.Reply,
 		}
 
-		if err := srv.{{.Name}}(req, stream); err != nil {
+		// io.EOF from a handler is the end of the stream, not a failure.
+		if err := srv.{{.Name}}(req, stream); err != nil && !errors.Is(err, io.EOF) {
 			if tracingEnabled {
 				span.RecordError(err)
 				span.SetStatus(codes.Error, err.Error())
 			}
-			errHeader := nats.Header{}
-			errHeader.Set("X-Error", err.Error())
+			errHeader := errorHeader(err)
 			errHeader.Set("Stream-EOF", "true")
 			nc.PublishMsg(&nats.Msg{
 				Subject: msg.Reply,
@@ -730,6 +727,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 
 	// Subscribe to init signal to start new streams with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}.init", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		defer recoverHandler("{{.ServiceName}}.{{.Name}}", nil)
 		streamID := msg.Header.Get("Stream-ID")
 
 		// Extract trace context
@@ -769,34 +767,44 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 
 		go func() {
 			defer span.End()
+			defer func() {
+				{{.Name}}_streamManager.mu.Lock()
+				delete({{.Name}}_streamManager.streams, streamID)
+				{{.Name}}_streamManager.mu.Unlock()
+			}()
+			respondErr := func(h nats.Header) {
+				nc.PublishMsg(&nats.Msg{Subject: handler.responseSubject, Header: h})
+			}
+			defer recoverHandler("{{.ServiceName}}.{{.Name}}", respondErr)
 
-			if err := srv.{{.Name}}(stream); err != nil {
+			err := srv.{{.Name}}(stream)
+			if err != nil && !errors.Is(err, io.EOF) {
 				if tracingEnabled {
 					span.RecordError(err)
 					span.SetStatus(codes.Error, err.Error())
 				}
-				errHeader := nats.Header{}
-				errHeader.Set("X-Error", err.Error())
-				nc.PublishMsg(&nats.Msg{
-					Subject: handler.responseSubject,
-					Header:  errHeader,
-				})
+				respondErr(errorHeader(err))
+				return
+			}
+
+			// The client is waiting for exactly one response; never leave it to time out.
+			stream.mu.Lock()
+			response := stream.response
+			stream.mu.Unlock()
+			if response == nil {
+				respondErr(errorHeader(newError(ErrorCodeInternal, "{{.ServiceName}}.{{.Name}} ended without a response: the handler must call SendAndClose")))
+				return
+			}
+			data, err := proto.Marshal(response)
+			if err != nil {
+				respondErr(errorHeader(newError(ErrorCodeInternal, fmt.Sprintf("failed to marshal response: %v", err))))
 				return
 			}
 
 			if tracingEnabled {
 				span.SetStatus(codes.Ok, "")
 			}
-
-			if stream.response != nil {
-				data, _ := proto.Marshal(stream.response)
-				nc.Publish(handler.responseSubject, data)
-			}
-
-			// Cleanup
-			{{.Name}}_streamManager.mu.Lock()
-			delete({{.Name}}_streamManager.streams, streamID)
-			{{.Name}}_streamManager.mu.Unlock()
+			nc.Publish(handler.responseSubject, data)
 		}()
 	}); err != nil {
 		return err
@@ -804,6 +812,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 
 	// Subscribe to data messages with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		defer recoverHandler("{{.ServiceName}}.{{.Name}}", nil)
 		streamID := msg.Header.Get("Stream-ID")
 
 		{{.Name}}_streamManager.mu.RLock()
@@ -834,6 +843,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 
 	// Subscribe to close signal with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}.close", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		defer recoverHandler("{{.ServiceName}}.{{.Name}}", nil)
 		streamID := msg.Header.Get("Stream-ID")
 
 		{{.Name}}_streamManager.mu.RLock()
@@ -844,9 +854,14 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 			return
 		}
 
-		// Close the receive channel to signal EOF
-		close(handler.recvCh)
+		// Close the receive channel to signal EOF; a repeated close signal is ignored.
+		select {
+		case <-handler.closeCh:
+			return
+		default:
+		}
 		close(handler.closeCh)
+		close(handler.recvCh)
 	}); err != nil {
 		return err
 	}
@@ -860,6 +875,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 
 	// Subscribe to init with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}.init", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		defer recoverHandler("{{.ServiceName}}.{{.Name}}", nil)
 		streamID := msg.Header.Get("Stream-ID")
 
 		// Extract trace context
@@ -894,25 +910,29 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 
 		go func() {
 			defer span.End()
+			defer stream.Close()
+			defer recoverHandler("{{.ServiceName}}.{{.Name}}", func(h nats.Header) {
+				h.Set("Stream-EOF", "true")
+				nc.PublishMsg(&nats.Msg{Subject: stream.sendSubject, Header: h})
+			})
 
-			if err := srv.{{.Name}}(stream); err != nil {
+			// io.EOF from a handler is the end of the stream, not a failure.
+			if err := srv.{{.Name}}(stream); err != nil && !errors.Is(err, io.EOF) {
 				if tracingEnabled {
 					span.RecordError(err)
 					span.SetStatus(codes.Error, err.Error())
 				}
-				errHeader := nats.Header{}
-				errHeader.Set("X-Error", err.Error())
+				errHeader := errorHeader(err)
 				errHeader.Set("Stream-EOF", "true")
 				nc.PublishMsg(&nats.Msg{
 					Subject: stream.sendSubject,
 					Header:  errHeader,
 				})
-			} else {
-				if tracingEnabled {
-					span.SetStatus(codes.Ok, "")
-				}
+				return
 			}
-			stream.Close()
+			if tracingEnabled {
+				span.SetStatus(codes.Ok, "")
+			}
 		}()
 	}); err != nil {
 		return err
@@ -920,6 +940,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 
 	// Subscribe to data with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}.in", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		defer recoverHandler("{{.ServiceName}}.{{.Name}}", nil)
 		streamID := msg.Header.Get("Stream-ID")
 
 		{{.Name}}_streamManager.mu.RLock()
@@ -945,6 +966,7 @@ var _ = template.Must(FileTemplate.New("serverMethodRegistration").Parse(`
 
 	// Subscribe to close with queue group
 	if _, err := nc.QueueSubscribe("{{.Topic}}.close", "{{.ServiceName}}.{{.Name}}", func(msg *nats.Msg) {
+		defer recoverHandler("{{.ServiceName}}.{{.Name}}", nil)
 		streamID := msg.Header.Get("Stream-ID")
 
 		{{.Name}}_streamManager.mu.Lock()
@@ -1031,6 +1053,12 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) Recv() ({{.OutputType}}
 	select {
 	case msg, ok := <-s.recvCh:
 		if !ok {
+			// The stream closes recvCh when it fails too; report the failure, not io.EOF.
+			select {
+			case err := <-s.errCh:
+				return nil, err
+			default:
+			}
 			return nil, io.EOF
 		}
 		return msg, nil
@@ -1141,11 +1169,17 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg
 	// Update activity timestamp atomically (lock-free)
 	atomic.StoreInt64(&s.lastActivityNano, time.Now().UnixNano())
 
-	// Check for EOF signal
-	if msg.Header.Get("Stream-EOF") == "true" {
+	// Check for error
+	// Checked before Stream-EOF: a failing server sends both on the same message.
+	if rpcErr := errorFromHeader(msg.Header); rpcErr != nil {
 		if tracingEnabled {
-			s.span.SetStatus(codes.Ok, "")
+			s.span.RecordError(rpcErr)
+			s.span.SetStatus(codes.Error, rpcErr.Code)
 			s.span.End()
+		}
+		select {
+		case s.errCh <- rpcErr:
+		default:
 		}
 		s.closeOnce.Do(func() {
 			close(s.recvCh)
@@ -1153,17 +1187,11 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleStreamMessage(msg
 		return
 	}
 
-	// Check for error
-	if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
-		err := fmt.Errorf("stream error: %s", errMsg)
+	// Check for EOF signal
+	if msg.Header.Get("Stream-EOF") == "true" {
 		if tracingEnabled {
-			s.span.RecordError(err)
-			s.span.SetStatus(codes.Error, errMsg)
+			s.span.SetStatus(codes.Ok, "")
 			s.span.End()
-		}
-		select {
-		case s.errCh <- err:
-		default:
 		}
 		s.closeOnce.Do(func() {
 			close(s.recvCh)
@@ -1269,18 +1297,17 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) CloseAndRecv() ({{.Outp
 			s.span.SetStatus(codes.Error, "failed to receive response")
 			s.span.End()
 		}
-		return nil, fmt.Errorf("failed to receive response: %w", err)
+		return nil, transportError("failed to receive response", err)
 	}
 
 	// Check for error
-	if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
-		err := fmt.Errorf("server error: %s", errMsg)
+	if rpcErr := errorFromHeader(msg.Header); rpcErr != nil {
 		if tracingEnabled && s.span.IsRecording() {
-			s.span.RecordError(err)
-			s.span.SetStatus(codes.Error, errMsg)
+			s.span.RecordError(rpcErr)
+			s.span.SetStatus(codes.Error, rpcErr.Code)
 			s.span.End()
 		}
-		return nil, err
+		return nil, rpcErr
 	}
 
 	out := &{{.OutputTypeName}}{}
@@ -1401,6 +1428,12 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) Recv() ({{.OutputType}}
 	select {
 	case msg, ok := <-s.recvCh:
 		if !ok {
+			// The stream closes recvCh when it fails too; report the failure, not io.EOF.
+			select {
+			case err := <-s.errCh:
+				return nil, err
+			default:
+			}
 			return nil, io.EOF
 		}
 		return msg, nil
@@ -1527,11 +1560,17 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleRecvMessage(msg *
 	// Update activity timestamp atomically (lock-free)
 	atomic.StoreInt64(&s.lastActivityNano, time.Now().UnixNano())
 
-	// Check for EOF
-	if msg.Header.Get("Stream-EOF") == "true" {
+	// Check for error
+	// Checked before Stream-EOF: a failing server sends both on the same message.
+	if rpcErr := errorFromHeader(msg.Header); rpcErr != nil {
 		if tracingEnabled {
-			s.span.SetStatus(codes.Ok, "")
+			s.span.RecordError(rpcErr)
+			s.span.SetStatus(codes.Error, rpcErr.Code)
 			s.span.End()
+		}
+		select {
+		case s.errCh <- rpcErr:
+		default:
 		}
 		s.closeOnce.Do(func() {
 			close(s.recvCh)
@@ -1539,17 +1578,11 @@ func (s *{{streamImplType .ServiceName .Name "Client"}}) handleRecvMessage(msg *
 		return
 	}
 
-	// Check for error
-	if errMsg := msg.Header.Get("X-Error"); errMsg != "" {
-		err := fmt.Errorf("stream error: %s", errMsg)
+	// Check for EOF
+	if msg.Header.Get("Stream-EOF") == "true" {
 		if tracingEnabled {
-			s.span.RecordError(err)
-			s.span.SetStatus(codes.Error, errMsg)
+			s.span.SetStatus(codes.Ok, "")
 			s.span.End()
-		}
-		select {
-		case s.errCh <- err:
-		default:
 		}
 		s.closeOnce.Do(func() {
 			close(s.recvCh)

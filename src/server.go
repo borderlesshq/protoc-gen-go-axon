@@ -126,6 +126,8 @@ func (s *Server) registerHandlers(sd *ServiceDesc, ss interface{}) error {
 		fullMethod := sd.ServiceName + "." + method.MethodName
 
 		if _, err := s.nc.QueueSubscribe(fullMethod, sd.ServiceName+"."+method.MethodName, func(msg *nats.Msg) {
+			defer recoverHandler(fullMethod, func(h nats.Header) { msg.RespondMsg(&nats.Msg{Header: h}) })
+
 			// Extract context with tracing
 			ctx := extractTraceContext(context.Background(), msg.Header)
 
@@ -138,18 +140,14 @@ func (s *Server) registerHandlers(sd *ServiceDesc, ss interface{}) error {
 			resp, err := method.Handler(ss, ctx, dec, s.opts.unaryInt)
 
 			if err != nil {
-				errHeader := nats.Header{}
-				errHeader.Set("X-Error", err.Error())
-				msg.RespondMsg(&nats.Msg{Header: errHeader})
+				msg.RespondMsg(&nats.Msg{Header: errorHeader(err)})
 				return
 			}
 
 			// Marshal response
 			data, err := proto.Marshal(resp.(proto.Message))
 			if err != nil {
-				errHeader := nats.Header{}
-				errHeader.Set("X-Error", fmt.Sprintf("failed to marshal response: %v", err))
-				msg.RespondMsg(&nats.Msg{Header: errHeader})
+				msg.RespondMsg(&nats.Msg{Header: errorHeader(newError(ErrorCodeInternal, fmt.Sprintf("failed to marshal response: %v", err)))})
 				return
 			}
 
