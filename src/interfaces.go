@@ -204,7 +204,10 @@ func (w *wrappedServerStream_{{.ServiceName}}_{{.Name}}) RecvMsg(m interface{}) 
 	if err != nil {
 		return err
 	}
-	*(m.({{.InputType}})) = *msg
+	// Merge rather than assign: proto messages hold internal state (a mutex) that must
+	// not be copied.
+	proto.Reset(m.({{.InputType}}))
+	proto.Merge(m.({{.InputType}}), msg)
 	return nil
 	{{else}}
 	return io.EOF // Server streaming doesn't receive from client
@@ -269,7 +272,10 @@ func (c *{{clientType .ServiceName}}) {{.Name}}(ctx context.Context, in {{.Input
 			if err != nil {
 				return err
 			}
-			*(reply.({{.OutputType}})) = *out
+			// Merge rather than assign: proto messages hold internal state (a mutex) that
+			// must not be copied.
+			proto.Reset(reply.({{.OutputType}}))
+			proto.Merge(reply.({{.OutputType}}), out)
 			return nil
 		}
 
